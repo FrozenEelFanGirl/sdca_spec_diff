@@ -8,6 +8,7 @@ Compare two versions of the MIPI SDCA specification and produce annotated interl
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt    # Windows
 # .venv/bin/pip install -r requirements.txt      # macOS/Linux
+# .venv/bin/pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/  # Alibaba Cloud mirror
 ```
 
 All subsequent commands use `.venv/Scripts/python` (Windows) or `.venv/bin/python` (macOS/Linux).

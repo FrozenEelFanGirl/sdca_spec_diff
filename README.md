@@ -12,6 +12,7 @@ Python 3.14 and the packages listed in `requirements.txt`.
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt    # Windows
 # .venv/bin/pip install -r requirements.txt      # macOS / Linux
+# .venv/bin/pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/  # Alibaba Cloud mirror
 ```
 
 ## Source Documents
