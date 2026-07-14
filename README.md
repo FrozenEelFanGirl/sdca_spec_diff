@@ -44,7 +44,7 @@ This scans `doc/sources/`, reads version metadata from each `.docx`, assigns bas
 python -X utf8 scripts/extract_all.py
 ```
 
-This runs the full pipeline: builds master indexes → extracts all sections/tables/figures → maps sections between versions → fingerprints content similarity. All output goes under `doc/output_<base>/`, `doc/output_<comp>/`, and `doc/comparison_<base>_<comp>/`.
+This runs the full pipeline: builds master indexes → extracts all sections/tables/figures → parses acronyms from section 2.4 → maps sections between versions → fingerprints content similarity. All output goes under `doc/output_<base>/`, `doc/output_<comp>/`, and `doc/comparison_<base>_<comp>/`.
 
 ### Stage 2 — Compare a Topic (repeat for each area of interest)
 
@@ -54,7 +54,7 @@ This runs the full pipeline: builds master indexes → extracts all sections/tab
 python -X utf8 scripts/search_sections.py "software sequence"
 ```
 
-Full-text search across the base document body text. Produces a report at `doc/comparison_<base>_<comp>/index/<keyword>.md` listing every section containing all search words, with match counts.
+Full-text search across the base document body text. Queries are expanded bidirectionally using acronyms from section 2.4 (e.g. "UAJ" also matches "Universal Audio Jack" and vice versa). Produces a report at `doc/comparison_<base>_<comp>/index/<keyword>.md` listing every section containing all search words, with match counts.
 
 **2. Select sections to compare:**
 
@@ -66,7 +66,7 @@ Edit the generated report — remove `✓` from any row you want to skip. By def
 python -X utf8 scripts/compare_sections.py doc/comparison_<base>_<comp>/index/<keyword>.md
 ```
 
-This creates interleaved comparison files for each checked section. Base content appears first; the comparison version content follows in blockquotes.
+This creates interleaved comparison files for each checked section. Paragraphs are aligned by content similarity: each base paragraph is immediately followed by its comparison counterpart in blockquotes (prefixed with `> **vX.Y:**`). Body paragraphs get word-level inline diffs — **bold** for new/changed text, ~~strikethrough~~ for removed text. Lists, tables, and code blocks are shown as-is.
 
 **4. Annotate changes:**
 
@@ -79,6 +79,7 @@ doc/
   sources/                    # <-- place .docx files here
   output_<base>/              # extracted base version
     index/index.json          # tracked in git
+    index/acronyms.json       # tracked in git (from section 2.4)
     sections/                 # section markdown
     tables/                   # standalone table files
     images/                   # extracted figures (PNG)
@@ -89,13 +90,15 @@ doc/
     index/                    # mapping + search reports + fingerprints
     sections/                 # interleaved comparison files
 scripts/
+  common.py                   # shared OOXML utilities and markdown rendering
   init_config.py              # discover versions, generate config
   extract_all.py              # full extraction pipeline
   extract_index.py            # build master index
   extract_section.py          # extract single section
+  extract_acronyms.py         # parse acronyms from section 2.4
   map_sections.py             # map + fingerprint sections across versions
-  search_sections.py          # full-text keyword search
-  compare_sections.py         # generate comparison files
+  search_sections.py          # full-text keyword search (with acronym expansion)
+  compare_sections.py         # generate interleaved comparison files (word-level diff)
   diff_images.py              # pixel-diff two figures
 ```
 
