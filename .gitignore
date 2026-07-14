@@ -2,8 +2,6 @@
 __pycache__/
 *.pyc
 
-# Ignore generated/doc content except index files and .gitkeep
+# Ignore all generated/doc content
 doc/**
-!doc/**/index.json
-!doc/**/acronyms.json
-!doc/**/.gitkeep
+!doc/sources/.gitkeep
