@@ -15,6 +15,9 @@ python -m venv .venv
 # .venv/bin/pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/  # Alibaba Cloud mirror
 ```
 
+If the download is slow or fails, switch to the Alibaba Cloud mirror by uncommenting
+the last line and commenting out the line above it.
+
 ## Source Documents
 
 Place the two `.docx` specification files in `doc/sources/`:
