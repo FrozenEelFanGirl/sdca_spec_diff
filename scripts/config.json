@@ -1,0 +1,14 @@
+{
+  "base": {
+    "version": "v1p2r17",
+    "docx": "doc/sources/mipi_DRAFT_SDCA_specification_v1-2r17.docx",
+    "output_dir": "doc/output_v1p2r17"
+  },
+  "comparison": {
+    "version": "v1p0",
+    "docx": "doc/sources/mipi_SDCA_specification_v1-0.docx",
+    "output_dir": "doc/output_v1p0"
+  },
+  "comparison_dir": "doc/comparison_v1p2r17_v1p0",
+  "mapping_file": "doc/comparison_v1p2r17_v1p0/index/full_mapping.json"
+}
