@@ -32,9 +32,12 @@ Python 3.14 and the packages listed in `requirements.txt`.
 
 ```bash
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt    # Windows
-# .venv/bin/pip install -r requirements.txt      # macOS / Linux
-# .venv/bin/pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/  # Alibaba Cloud mirror
+source .venv/Scripts/activate                    # Windows (Git Bash)
+# .venv\Scripts\activate.bat                     # Windows (CMD)
+# .venv\Scripts\Activate.ps1                     # Windows (PowerShell)
+# source .venv/bin/activate                      # macOS / Linux
+pip install -r requirements.txt
+# pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/  # Alibaba Cloud mirror
 ```
 
 If the download is slow or fails, switch to the Alibaba Cloud mirror by uncommenting
