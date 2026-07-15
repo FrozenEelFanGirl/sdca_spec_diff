@@ -101,9 +101,51 @@ def word_match(qw, tw):
     return False
 
 
+def _phrase_matches_at(text_words: list[str], query_words: list[str],
+                       start: int) -> bool:
+    """Check if query_words match text_words starting at position *start*."""
+    if start + len(query_words) > len(text_words):
+        return False
+    return all(word_match(qw, text_words[start + j])
+               for j, qw in enumerate(query_words))
+
+
+def phrase_match(query_words: list[str], text_words: list[str]) -> bool:
+    """Check if query_words appear consecutively in text_words."""
+    for i in range(len(text_words) - len(query_words) + 1):
+        if _phrase_matches_at(text_words, query_words, i):
+            return True
+    return False
+
+
+def count_phrase_matches(query_words: list[str],
+                         text_words: list[str]) -> int:
+    """Count non-overlapping occurrences of a phrase in text_words."""
+    count = 0
+    i = 0
+    while i <= len(text_words) - len(query_words):
+        if _phrase_matches_at(text_words, query_words, i):
+            count += 1
+            i += len(query_words)
+        else:
+            i += 1
+    return count
+
+
+def _candidate_matches_any(candidate: str, text_words: list[str],
+                          text_words_set: set[str]) -> bool:
+    """Check if *candidate* matches any word in *text_words*."""
+    if candidate in text_words_set:
+        return True
+    if len(candidate) >= 4:
+        return any(word_match(candidate, tw) for tw in text_words)
+    return False
+
+
 def all_words_match(query_words, text, acronyms=None):
     """Check if ALL query words (or their acronym synonyms) match in text."""
     text_words = tokenize(text)
+    text_words_set = set(text_words)
     if acronyms is None:
         acronyms = {}
     for qw in query_words:
@@ -116,7 +158,8 @@ def all_words_match(query_words, text, acronyms=None):
             if qw.lower() in set(tokenize(defn)):
                 candidates.add(acr.lower())
         # At least one candidate must match
-        if not any(any(word_match(c, tw) for tw in text_words) for c in candidates):
+        if not any(_candidate_matches_any(c, text_words, text_words_set)
+                   for c in candidates):
             return False
     return True
 
@@ -124,6 +167,7 @@ def all_words_match(query_words, text, acronyms=None):
 def count_matches(query_words, text, acronyms=None):
     """Count word matches including acronym synonyms."""
     text_words = tokenize(text)
+    text_words_set = set(text_words)
     if acronyms is None:
         acronyms = {}
     expanded = set(query_words)
@@ -134,8 +178,18 @@ def count_matches(query_words, text, acronyms=None):
         for acr, defn in acronyms.items():
             if qw.lower() in set(tokenize(defn)):
                 expanded.add(acr.lower())
-    return sum(1 for tw in text_words
-               for qw in expanded if word_match(qw, tw))
+
+    count = 0
+    for tw in text_words:
+        if tw in expanded:
+            count += 1
+            continue
+        for qw in expanded:
+            if len(qw) >= 4 and len(tw) >= 4:
+                if tw.startswith(qw) or qw.startswith(tw):
+                    count += 1
+                    break
+    return count
 
 
 # ── Document parsing ───────────────────────────────────────────────────────
@@ -148,16 +202,8 @@ def para_text(p_elem):
     return ''.join(parts)
 
 
-# ── Search ──────────────────────────────────────────────────────────────────
-
-def search(keyword, docx_path, acronyms=None):
-    query_words = tokenize(keyword)
-    if not query_words:
-        print('Error: empty query', file=sys.stderr)
-        sys.exit(1)
-    if acronyms is None:
-        acronyms = {}
-
+def _parse_docx(docx_path: Path):
+    """Yield (num, heading, level, all_text) for every section in the docx."""
     z = zipfile.ZipFile(str(docx_path))
     styles_xml = z.read('word/styles.xml')
     style_map = build_style_map(styles_xml)
@@ -167,7 +213,6 @@ def search(keyword, docx_path, acronyms=None):
 
     num_to_heading, _ = parse_toc(doc_xml)
 
-    # Find heading positions
     body_children = list(body)
     heading_positions = []
     for idx, child in enumerate(body_children):
@@ -186,19 +231,17 @@ def search(keyword, docx_path, acronyms=None):
         text = para_text(child).strip()
         if not text:
             continue
-        # Match to TOC heading
-        h_norm = re.sub(r'^[\dA-Z\.]+\s*', '', text.lower().replace('–', '-').replace('—', '-')).strip()
+        h_norm = re.sub(r'^[\dA-Z\.]+\s*', '',
+                        text.lower().replace('–', '-').replace('—', '-')).strip()
         for num, heading in num_to_heading.items():
-            nh = re.sub(r'^[\dA-Z\.]+\s*', '', heading.lower().replace('–', '-').replace('—', '-')).strip()
+            nh = re.sub(r'^[\dA-Z\.]+\s*', '',
+                        heading.lower().replace('–', '-').replace('—', '-')).strip()
             if nh == h_norm:
                 heading_positions.append((idx, num, text, lvl))
                 break
 
     section_to_pos = {hp[1]: i for i, hp in enumerate(heading_positions)}
-
-    # For each section in TOC, collect body text and count matches
     all_nums = sorted(num_to_heading.keys(), key=sort_key)
-    results = []
 
     for section_num in all_nums:
         if section_num not in section_to_pos:
@@ -231,49 +274,104 @@ def search(keyword, docx_path, acronyms=None):
                         if text:
                             all_text += text + ' '
 
-        if not all_words_match(query_words, all_text, acronyms):
-            continue
+        yield section_num, heading_text, target_level, all_text
 
-        match_count = count_matches(query_words, all_text, acronyms)
-        results.append((section_num, heading_text, target_level, match_count))
+
+# ── Search ──────────────────────────────────────────────────────────────────
+
+def search(keyword: str, docx_path: Path, acronyms=None,
+           phrase: bool = False):
+    query_words = tokenize(keyword)
+    if not query_words:
+        print('Error: empty query', file=sys.stderr)
+        sys.exit(1)
+    if acronyms is None:
+        acronyms = {}
+
+    results = []
+    for section_num, heading_text, level, all_text in _parse_docx(docx_path):
+        if phrase:
+            text_words = tokenize(all_text)
+            match_count = count_phrase_matches(query_words, text_words)
+            matched = match_count > 0
+        else:
+            match_count = count_matches(query_words, all_text, acronyms)
+            matched = all_words_match(query_words, all_text, acronyms)
+        results.append((section_num, heading_text, level, match_count, matched))
 
     results.sort(key=lambda x: sort_key(x[0]))
     return results, keyword
 
 
+def search_section(section_num: str, docx_path: Path):
+    """Return all sections, with only *section_num* pre-checked."""
+    results = []
+    for num, heading, level, _ in _parse_docx(docx_path):
+        matched = (num == section_num)
+        results.append((num, heading, level, 0, matched))
+    return results, section_num
+
+
 # ── Output ──────────────────────────────────────────────────────────────────
 
-def render(results, keyword):
+def render(results, keyword, mode='search'):
+    matched_count = sum(1 for r in results if r[4])
     lines = []
-    lines.append(f'## Search results for "{keyword}"')
+    if mode == 'section':
+        lines.append(f'## Section: {keyword}')
+    else:
+        label = 'Phrase search' if mode == 'phrase' else 'Search'
+        lines.append(f'## {label} results for "{keyword}"')
     lines.append('')
-    lines.append(f'{len(results)} sections found in base docx body text.')
+    lines.append(f'{matched_count} of {len(results)} sections matched.')
     lines.append('')
     lines.append(f'| Compare? | Section | Heading | Matches |')
     lines.append(f'|-----------|---------|---------|---------|')
 
-    for num, heading, level, count in results:
+    for num, heading, level, count, matched in results:
         indent = '  ' * level
-        lines.append(f'| ✓ | {num} | {indent}{heading} | {count} |')
+        check = '✓' if matched else ''
+        lines.append(f'| {check} | {num} | {indent}{heading} | {count} |')
 
     out = '\n'.join(lines) + '\n'
     return out
 
 
 def main():
-    if len(sys.argv) < 2:
+    docx_path, out_dir, cfg = _resolve_docx_and_out()
+    args = sys.argv[1:]
+
+    if not args:
         print(__doc__, file=sys.stderr)
         sys.exit(1)
 
-    docx_path, out_dir, cfg = _resolve_docx_and_out()
-    acronyms = _load_acronyms(cfg)
-    keyword = sys.argv[1]
-    results, kw = search(keyword, docx_path, acronyms)
+    section_mode = None
+    phrase_mode = False
 
-    output = render(results, kw)
+    if '--section' in args:
+        idx = args.index('--section')
+        section_mode = args.pop(idx + 1)
+        args.pop(idx)
+    if '--phrase' in args:
+        phrase_mode = True
+        args.remove('--phrase')
+
+    if section_mode:
+        results, kw = search_section(section_mode, docx_path)
+        output = render(results, kw, mode='section')
+        slug = f'section_{section_mode.replace(".", "_")}'
+    elif len(args) >= 1:
+        keyword = args[0]
+        acronyms = _load_acronyms(cfg)
+        results, kw = search(keyword, docx_path, acronyms, phrase=phrase_mode)
+        mode = 'phrase' if phrase_mode else 'search'
+        output = render(results, kw, mode=mode)
+        slug = re.sub(r'[^\w\s-]', '', keyword).strip().replace(' ', '_')
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
 
     os.makedirs(str(out_dir), exist_ok=True)
-    slug = re.sub(r'[^\w\s-]', '', keyword).strip().replace(' ', '_')
     out_path = out_dir / f'{slug}.md'
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(output)

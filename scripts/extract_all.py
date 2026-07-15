@@ -58,7 +58,7 @@ def step_index(cfg):
 
 def step_extract(cfg):
     """Extract all sections for both versions."""
-    from batch_extract import batch_extract
+    from extract_section import extract_sections
 
     for label, ver in [('base', cfg.base), ('comparison', cfg.comparison)]:
         print(f'\n=== Extracting {label} ({ver.version}) ===')
@@ -68,8 +68,18 @@ def step_extract(cfg):
                 shutil.rmtree(str(d))
             d.mkdir(parents=True, exist_ok=True)
 
-        count = batch_extract(str(ver.docx), str(ver.output_dir), str(ver.index_file))
+        count = extract_sections(str(ver.docx), str(ver.output_dir), str(ver.index_file))
         print(f'  {count} sections extracted to {ver.sections_dir.relative_to(ROOT)}')
+
+
+def step_fixups(cfg):
+    """Apply known text corrections to extracted sections."""
+    from extract_fixups import apply_fixups
+
+    for label, ver in [('base', cfg.base), ('comparison', cfg.comparison)]:
+        print(f'\n=== Applying fixups for {label} ({ver.version}) ===')
+        count = apply_fixups(ver.output_dir)
+        print(f'  {count} file(s) modified')
 
 
 def step_acronyms(cfg):
@@ -147,6 +157,7 @@ def main():
 
     step_index(cfg)
     step_extract(cfg)
+    step_fixups(cfg)
     step_acronyms(cfg)
     step_map(cfg)
 

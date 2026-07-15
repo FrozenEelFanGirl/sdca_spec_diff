@@ -66,6 +66,41 @@ DEFINITION_STYLES = {'Definition'}
 FIGURE_TITLE_STYLES = {'FigureTitle'}
 TABLE_TITLE_STYLES = {'TableTitle'}
 
+# ── Spelling variants ────────────────────────────────────────────────────────
+
+SPELLING_VARIANTS = {
+    # British → American (and other common variants)
+    'grey': 'gray',
+    'colour': 'color',
+    'centre': 'center',
+    'behaviour': 'behavior',
+    'analyse': 'analyze',
+    'metre': 'meter',
+    'organise': 'organize',
+    'realise': 'realize',
+    'defence': 'defense',
+    'licence': 'license',
+    'analogue': 'analog',
+    'catalogue': 'catalog',
+    'modelled': 'modeled',
+    'travelling': 'traveling',
+    'labelled': 'labeled',
+    'fuelled': 'fueled',
+    'signalling': 'signaling',
+    'programme': 'program',
+    'artefact': 'artifact',
+    'fibre': 'fiber',
+    'litre': 'liter',
+    'lustre': 'luster',
+    'manoeuvre': 'maneuver',
+    'mould': 'mold',
+    'practise': 'practice',
+    'sceptic': 'skeptic',
+    'storey': 'story',
+    'sulphur': 'sulfur',
+    'tyre': 'tire',
+}
+
 
 # ── TOC parsing ─────────────────────────────────────────────────────────────
 
@@ -166,7 +201,7 @@ def para_to_markdown(p_elem):
         t = run.find(f'{{{W}}}t')
         if t is None or not t.text:
             continue
-        text = t.text
+        text = t.text.replace('<', r'\<').replace('>', r'\>')
 
         if is_bold and is_italic:
             text = f'***{text}***'
@@ -285,6 +320,177 @@ def resolve_refs(text, index):
         result.append(line)
 
     return '\n'.join(result)
+
+
+# ── Image extraction helpers ─────────────────────────────────────────────────
+
+def extract_image_file(rid, rels_map, zip_file, images_dir):
+    """Extract an image from the docx and convert to PNG. Returns saved filename."""
+    target = rels_map[rid]
+    zip_path = 'word/' + target
+    img_data = zip_file.read(zip_path)
+
+    name, ext = os.path.splitext(os.path.basename(target))
+    png_name = name + '.png'
+    png_path = os.path.join(images_dir, png_name)
+
+    if ext.lower() in ('.emf', '.wmf'):
+        try:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(img_data))
+            img.save(png_path, 'PNG')
+        except Exception:
+            with open(os.path.join(images_dir, os.path.basename(target)), 'wb') as f:
+                f.write(img_data)
+            return os.path.basename(target)
+    else:
+        with open(png_path, 'wb') as f:
+            f.write(img_data)
+
+    return png_name
+
+
+def find_image_in_paragraph(p_elem, zip_file, rels_map, images_dir):
+    """Check a paragraph for embedded images/OLE objects and extract them.
+    Returns saved filename or None."""
+    # Regular drawing (w:r > w:drawing > a:blip)
+    for drawing in p_elem.findall(f'.//{{{W}}}drawing'):
+        for blip in drawing.findall(f'.//{{{A}}}blip'):
+            embed = blip.get(f'{{{R}}}embed')
+            if embed and embed in rels_map:
+                return extract_image_file(embed, rels_map, zip_file, images_dir)
+
+    # OLE object preview (w:r > w:object > v:imagedata)
+    for obj in p_elem.findall(f'.//{{{W}}}object'):
+        for imagedata in obj.findall(f'.//{{{VML}}}imagedata'):
+            rid = imagedata.get(f'{{{R}}}id')
+            if rid and rid in rels_map:
+                return extract_image_file(rid, rels_map, zip_file, images_dir)
+
+    return None
+
+
+def peek_next_figure_title(p_elem):
+    """Look ahead from an image paragraph to find a FigureTitle caption.
+    Returns (caption_text, caption_element) or (None, None)."""
+    next_sib = p_elem.getnext()
+    while next_sib is not None and next_sib.tag == f'{{{W}}}p':
+        pPr = next_sib.find(f'{{{W}}}pPr', NS)
+        style_id = None
+        if pPr is not None:
+            pStyle = pPr.find(f'{{{W}}}pStyle', NS)
+            if pStyle is not None:
+                style_id = pStyle.get(f'{{{W}}}val')
+
+        text = para_to_markdown(next_sib).strip()
+        if text:
+            if style_id in FIGURE_TITLE_STYLES:
+                return text, next_sib
+            else:
+                return None, None
+        next_sib = next_sib.getnext()
+    return None, None
+
+
+# ── Shared section content processing ────────────────────────────────────────
+
+def process_content_paragraph(child, z, rels_map, images_dir, handled_elements,
+                              style_id, text, num_counters, pending_caption):
+    """Process a body paragraph within a section.
+
+    Handles image extraction, style dispatch (bullet/numbered/code/note/
+    definition/figure-title/table-title/body), and pending caption tracking.
+
+    Mutates *num_counters* and *handled_elements* in place.
+    Returns (output_item, new_pending_caption).
+    *output_item* is None when the paragraph should be skipped.
+    """
+    # ── Image extraction ──
+    if rels_map:
+        img_filename = find_image_in_paragraph(child, z, rels_map, images_dir)
+        if img_filename:
+            caption, caption_elem = peek_next_figure_title(child)
+            if caption:
+                handled_elements.add(caption_elem)
+                m = re.match(r'Figure\s+(\d+)', caption)
+                if m:
+                    new_name = f'Figure{m.group(1)}.png'
+                    old_path = os.path.join(images_dir, img_filename)
+                    new_path = os.path.join(images_dir, new_name)
+                    if old_path != new_path:
+                        if os.path.exists(new_path):
+                            os.remove(new_path)
+                        os.rename(old_path, new_path)
+                    img_filename = new_name
+                return ('image_with_caption', (img_filename, caption)), pending_caption
+            else:
+                return ('image_only', img_filename), pending_caption
+
+    if not text:
+        return None, pending_caption
+
+    if child in handled_elements:
+        return None, pending_caption
+
+    # ── Style dispatch ──
+    if style_id in BULLET_STYLES:
+        indent = get_list_indent(style_id)
+        for k in list(num_counters):
+            if k > indent:
+                del num_counters[k]
+        return ('bullet', (indent, text)), pending_caption
+
+    if style_id in NUMBERED_STYLES:
+        indent = get_list_indent(style_id)
+        for k in list(num_counters):
+            if k > indent:
+                del num_counters[k]
+        num_counters[indent] = num_counters.get(indent, 0) + 1
+        return ('numbered', (indent, num_counters[indent], text)), pending_caption
+
+    if style_id in CODE_STYLES:
+        return ('code', text), pending_caption
+
+    if style_id in NOTE_HEAD_STYLES:
+        return ('note_head', text), pending_caption
+
+    if style_id in NOTE_BODY_STYLES:
+        return ('note_body', text), pending_caption
+
+    if style_id in DEFINITION_STYLES:
+        return ('definition', text), pending_caption
+
+    if style_id in FIGURE_TITLE_STYLES:
+        return ('figure_title', text), pending_caption
+
+    if style_id in TABLE_TITLE_STYLES:
+        m = re.match(r'Table\s+(\d+)\s+(.+)', text)
+        if m:
+            return None, (text, m.group(1))
+        else:
+            return ('table_title', text), pending_caption
+
+    # Body text — reset counters on transition from structured content
+    num_counters.clear()
+    return ('body', text), pending_caption
+
+
+def process_content_table(tbl_elem, pending_caption, tables_written):
+    """Process a w:tbl element within a section.
+
+    Mutates *tables_written* in place.
+    Returns (output_item, new_pending_caption).
+    """
+    md_table = table_to_markdown(tbl_elem)
+    if md_table and pending_caption:
+        caption_text, table_num = pending_caption
+        table_md = f'**{caption_text}**\n\n{md_table}\n'
+        tables_written[table_num] = table_md
+        return ('table_with_caption', (md_table, caption_text, table_num)), None
+    elif md_table:
+        return ('table', md_table), pending_caption
+    return None, pending_caption
 
 
 # ── Sorting ─────────────────────────────────────────────────────────────────

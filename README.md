@@ -77,14 +77,19 @@ This runs the full pipeline: builds master indexes → extracts all sections/tab
 **1. Search for sections:**
 
 ```bash
+# Word-level AND matching (acronym expansion, prefix support):
 python -X utf8 scripts/search_sections.py "software sequence"
+# Exact phrase matching (words must appear consecutively):
+python -X utf8 scripts/search_sections.py --phrase "DisCo Addressing"
+# Pre-select a specific section number:
+python -X utf8 scripts/search_sections.py --section 5.1
 ```
 
-Full-text search across the base document body text. Queries are expanded bidirectionally using acronyms from section 2.4 (e.g. "UAJ" also matches "Universal Audio Jack" and vice versa). Produces a report at `doc/comparison_<base>_<comp>/index/<keyword>.md` listing every section containing all search words, with match counts.
+Produces a checklist of **all** 592 sections, with matching ones pre-checked (`✓`). Reports are saved to `doc/comparison_<base>_<comp>/index/<keyword>.md` (or `section_<num>.md` for `--section`).
 
 **2. Select sections to compare:**
 
-Edit the generated report — remove `✓` from any row you want to skip. By default all rows are checked.
+Edit the generated report — remove `✓` from unwanted rows, or add `✓` to additional sections.
 
 **3. Generate comparison files:**
 

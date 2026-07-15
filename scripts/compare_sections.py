@@ -21,15 +21,15 @@
 """
 Generate interleaved comparison files from a search report.
 
-Reads a search report markdown with ✓ checkboxes. For each checked section,
-interleaves base content with the comparison counterpart in blockquotes,
-aligning paragraphs so the old version text immediately follows each new-version
-paragraph.
-
 Usage:
   python -X utf8 scripts/compare_sections.py <report.md>
 
-If <report.md> is not specified, compares ALL sections in the mapping.
+Diff rules:
+  - equal:             base as-is,  comp *Unchanged.*
+  - index/spelling:    base as-is,  comp *Unchanged (besides ...)*
+  - content changed:   base **bold**, comp **bold**
+  - new (base only):   base **bold**, comp *New in this version*
+  - deleted (comp only):            comp ~~strikethrough~~
 """
 
 import sys
@@ -43,105 +43,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import load_config
+from common import SPELLING_VARIANTS
+from diff_images import diff_images
 
 
-def parse_report(report_path: Path) -> list[str]:
-    """Parse a search report markdown, return list of checked section numbers."""
-    with open(report_path, encoding='utf-8') as f:
-        content = f.read()
-
-    checked = []
-    for line in content.split('\n'):
-        m = re.match(r'\|\s*✓\s*\|\s*([\d.]+)\s*\|', line)
-        if m:
-            checked.append(m.group(1))
-    return checked
-
-
-def find_counterpart(section_num: str, mapping: list[dict]) -> dict | None:
-    """Find the comparison counterpart for a base section in the mapping."""
-    for m in mapping:
-        if m.get('base_num') == section_num:
-            return m
-    return None
-
-
-def read_section_file(sections_dir: Path, section_num: str) -> str | None:
-    """Read a section markdown file by number prefix."""
-    prefix = f'{section_num}_'
-    for f in sorted(sections_dir.iterdir()):
-        if f.name.startswith(prefix) and f.suffix == '.md':
-            return f.read_text(encoding='utf-8')
-    return None
-
-
-def _split_blocks(text: str) -> list[str]:
-    """Split markdown text into logical blocks for alignment.
-
-    Blocks are separated by blank lines AND by style transitions
-    (e.g. a body paragraph followed by a list starts a new block).
-    Multi-line elements of the same type stay together.
-    """
-    raw_blocks: list[list[str]] = []
-    current: list[str] = []
-    for line in text.split('\n'):
-        if not line.strip():
-            if current:
-                raw_blocks.append(current)
-                current = []
-        else:
-            current.append(line)
-    if current:
-        raw_blocks.append(current)
-
-    # Further split blocks at style transitions
-    blocks: list[str] = []
-    for block_lines in raw_blocks:
-        subgroups: list[list[str]] = []
-        sub: list[str] = []
-        prev_kind: str | None = None
-        for line in block_lines:
-            stripped = line.strip()
-            if re.match(r'^#{1,6}\s', stripped):
-                kind = 'heading'
-            elif re.match(r'^\s*\d+\.\s', stripped):
-                kind = 'numbered'
-            elif re.match(r'^\s*[-*]\s', stripped):
-                kind = 'bullet'
-            elif stripped.startswith('>'):
-                kind = 'note'
-            elif stripped.startswith('|'):
-                kind = 'table'
-            elif stripped.startswith('```'):
-                kind = 'code'
-            elif stripped.startswith('!['):
-                kind = 'image'
-            else:
-                kind = 'body'
-
-            # Notes and body paragraphs don't trigger splits — they stay
-            # grouped with adjacent list items (e.g. "> Note:" lines
-            # embedded in numbered steps belong to the same block).
-            no_split = {'body', 'note'}
-            if prev_kind is not None and kind != prev_kind and kind not in no_split:
-                if sub:
-                    subgroups.append(sub)
-                sub = []
-            elif prev_kind is not None and prev_kind not in no_split and kind in no_split:
-                if sub:
-                    subgroups.append(sub)
-                sub = []
-
-            sub.append(line)
-            prev_kind = kind
-        if sub:
-            subgroups.append(sub)
-
-        for sg in subgroups:
-            blocks.append('\n'.join(sg))
-
-    return blocks
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers — classification
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _is_heading(block: str) -> bool:
     return bool(re.match(r'^#{1,6}\s', block))
@@ -149,352 +57,1183 @@ def _is_heading(block: str) -> bool:
 
 def _is_list(block: str) -> bool:
     first = block.split('\n')[0]
-    return bool(re.match(r'^\s*[-*\d]+', first))
+    return bool(re.match(r'^\s*([-*] |\d+\.)', first))
 
 
-def _normalize_block(block: str) -> str:
-    """Strip formatting for comparison — lowercase, no markdown syntax."""
+def _is_table(block: str) -> bool:
+    return block.startswith('|')
+
+
+
+def _classify(block: str) -> str:
+    """Return block category: heading / list / table / figure / paragraph."""
+    if not block:
+        return 'paragraph'
+    if _is_heading(block):
+        return 'heading'
+    if _is_list(block):
+        return 'list'
+    if _is_table(block):
+        return 'table'
+    if block.startswith('!['):
+        return 'figure'
+    return 'paragraph'
+
+
+def _strip_blockquotes(text: str) -> str:
+    """Strip '> ' prefix and collapse consecutive blockquote lines into
+    single paragraphs so notes don't get split into multiple blocks."""
+    result: list[str] = []
+    in_note = False
+    for line in text.split('\n'):
+        if line.startswith('> '):
+            stripped = line[2:]
+            if in_note:
+                result[-1] = result[-1] + ' ' + stripped
+            else:
+                result.append(stripped)
+                in_note = True
+        else:
+            result.append(line)
+            in_note = False
+    return '\n'.join(result)
+
+
+def _split_blocks(text: str) -> list[str]:
+    """Split markdown into logical blocks at blank lines and style transitions."""
+    raw: list[list[str]] = []
+    cur: list[str] = []
+    for line in text.split('\n'):
+        if not line.strip():
+            if cur:
+                raw.append(cur); cur = []
+        else:
+            cur.append(line)
+    if cur:
+        raw.append(cur)
+
+    blocks: list[str] = []
+    for group in raw:
+        subs: list[list[str]] = []
+        sub: list[str] = []
+        prev: str | None = None
+        for line in group:
+            s = line.strip()
+            if re.match(r'^#{1,6}\s', s):    kind = 'heading'
+            elif re.match(r'^\s*\d+\.\s', s): kind = 'numbered'
+            elif re.match(r'^\s*[-*]\s', s):  kind = 'bullet'
+            elif s.startswith('>'):           kind = 'note'
+            elif s.startswith('|'):           kind = 'table'
+            elif s.startswith('```'):         kind = 'code'
+            elif s.startswith('!['):          kind = 'image'
+            else:                             kind = 'body'
+
+            no_split = {'body', 'note'}
+            if prev is not None and kind != prev and kind not in no_split:
+                if sub: subs.append(sub); sub = []
+            elif prev is not None and prev not in no_split and kind in no_split:
+                if sub: subs.append(sub); sub = []
+            sub.append(line); prev = kind
+        if sub: subs.append(sub)
+        for sg in subs:
+            blocks.append('\n'.join(sg))
+    return blocks
+
+
+def _split_paragraphs(blocks: list[str]) -> list[str]:
+    """Split body-paragraph blocks into individual paragraphs.
+
+    Blocks that are not body paragraphs (headings, lists, tables, figures)
+    are passed through unchanged.  Body-paragraph blocks are split on
+    newlines so that every natural paragraph gets its own block for
+    comparison.
+    """
+    result: list[str] = []
+    for b in blocks:
+        if (_is_heading(b) or _is_list(b) or _is_table(b)
+                or b.startswith('![')):
+            result.append(b)
+        else:
+            for para in b.split('\n'):
+                if para.strip():
+                    result.append(para.strip())
+    return result
+
+
+def _split_all(blocks: list[str]) -> list[str]:
+    """Split body paragraphs into individual blocks.
+    Lists and tables stay as whole blocks — per-item / per-row
+    diffing is handled internally by _diff_list / _diff_table."""
+    blocks = _split_paragraphs(blocks)
+    return blocks
+
+
+def _split_list_items(list_block: str) -> list[str]:
+    """Split a list block into top-level items (sub-items stay attached)."""
+    if not list_block.strip():
+        return [list_block]
+    lines = list_block.split('\n')
+    item_re = re.compile(r'^(\s*)([-*]|\d+\.)\s')
+    min_indent = None
+    for line in lines:
+        m = item_re.match(line)
+        if m:
+            indent = len(m.group(1))
+            if min_indent is None or indent < min_indent:
+                min_indent = indent
+    if min_indent is None:
+        return [list_block]
+    splits = [i for i, line in enumerate(lines)
+              if item_re.match(line) and len(item_re.match(line).group(1)) == min_indent]
+    items = []
+    for i, s in enumerate(splits):
+        e = splits[i + 1] if i + 1 < len(splits) else len(lines)
+        items.append('\n'.join(lines[s:e]))
+    return items
+
+
+def _split_all_numbered_items(list_block: str) -> list[str]:
+    """Split a numbered list into all items at every indentation level."""
+    if not list_block.strip():
+        return []
+    lines = list_block.split('\n')
+    item_re = re.compile(r'^(\s*)\d+\.\s')
+    splits = [i for i, line in enumerate(lines) if item_re.match(line)]
+    if not splits:
+        return []
+    items = []
+    for idx, s in enumerate(splits):
+        e = splits[idx + 1] if idx + 1 < len(splits) else len(lines)
+        items.append('\n'.join(lines[s:e]))
+    return items
+
+
+def _get_numbered_item_info(item_text: str) -> tuple[int, int] | None:
+    """Return (indent, number) from a numbered list item's first line."""
+    first_line = item_text.split('\n')[0]
+    m = re.match(r'^(\s*)(\d+)\.\s', first_line)
+    if m:
+        return (len(m.group(1)), int(m.group(2)))
+    return None
+
+
+def _merge_split_numbered_lists(blocks: list[str]) -> list[str]:
+    """Reassemble numbered list fragments that were split by intervening
+    non-heading blocks (tables, figures, notes).
+
+    Merge rule (numbered lists only, not bullet -/*):
+      1. Find List A → intervening non-heading blocks → List B
+      2. First item of List B: indentation = ML, number = M
+      3. Last item in List A at indentation ML: number = N
+      4. If N + 1 == M → merge, move intervening blocks to end
+    Iterates until no more merges.
+    """
+    numbered_re = re.compile(r'^\s*\d+\.\s')
+
+    def _is_numbered_list(block: str) -> bool:
+        return bool(numbered_re.match(block.split('\n')[0]))
+
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(blocks):
+            if not _is_list(blocks[i]) or not _is_numbered_list(blocks[i]):
+                i += 1
+                continue
+
+            # List A at index i — scan ahead for List B
+            j = i + 1
+            while j < len(blocks):
+                bj = blocks[j]
+                if _is_heading(bj):
+                    break
+                if _is_list(bj) and _is_numbered_list(bj):
+                    # Found a numbered List B at j
+                    b_items = _split_all_numbered_items(bj)
+                    if not b_items:
+                        break
+                    b_info = _get_numbered_item_info(b_items[0])
+                    if not b_info:
+                        break
+                    ml, m = b_info
+
+                    # Find last item in List A at indentation == ml
+                    a_items = _split_all_numbered_items(blocks[i])
+                    n = None
+                    for item in reversed(a_items):
+                        info = _get_numbered_item_info(item)
+                        if info and info[0] == ml:
+                            n = info[1]
+                            break
+
+                    if n is not None and n + 1 == m:
+                        # Merge: append List B items to List A,
+                        # then remove List B.  Intervening blocks
+                        # stay where they are — they're already
+                        # after the merged list.
+                        blocks[i] = blocks[i] + '\n' + blocks[j]
+                        del blocks[j]
+                        changed = True
+                        break
+                    else:
+                        # Non-consecutive numbering — this is a genuinely
+                        # different list, not a split fragment.  Do not
+                        # scan past it for a later list that might match
+                        # (out of scope — list fragments appear in order).
+                        break
+                j += 1
+
+            if changed:
+                break  # restart outer while
+            i += 1
+    return blocks
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers — normalization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _normalize_block(block: str, apply_spelling: bool = True) -> str:
     t = block.lower()
     t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
     t = re.sub(r'\*\*([^*]+)\*\*', r'\1', t)
     t = re.sub(r'\*([^*]+)\*', r'\1', t)
-    t = re.sub(r'!\[.*?\]\(.*?\)', '', t)
+    t = re.sub(r'!\[(.*?)\]\(.*?\)', r'\1', t)
     t = re.sub(r'[^\w\s]', '', t)
-    t = re.sub(r'\s+', ' ', t).strip()
+    if apply_spelling:
+        words = [SPELLING_VARIANTS.get(w, w) for w in t.split()]
+        t = ' '.join(words).strip()
+    else:
+        t = re.sub(r'\s+', ' ', t).strip()
     return t
 
 
-def _block_similarity(b1: str, b2: str) -> float:
-    """Similarity between two blocks (0-1) using word trigrams."""
-    def trigrams(s):
-        words = s.split()
-        return set(tuple(words[i:i+3]) for i in range(len(words)-2))
-    tg1, tg2 = trigrams(_normalize_block(b1)), trigrams(_normalize_block(b2))
-    if not tg1 or not tg2:
-        return 0.0
-    return len(tg1 & tg2) / len(tg1 | tg2)
+def _normalize_indices(text: str) -> str:
+    t = text
+    t = re.sub(r'\[Table\s+\d+(?:\.\d+)?', '[Table @INDEX', t)
+    t = re.sub(r'\[Figure\s+\d+(?:\.\d+)?', '[Figure @INDEX', t)
+    t = re.sub(r'\[Section\s+[\d]+(?:\.[\d]+)*', '[Section @INDEX', t)
+    t = re.sub(r'\*\*Table\s+\d+', '**Table @INDEX', t)
+    t = re.sub(r'\*\*Figure\s+\d+', '**Figure @INDEX', t)
+    t = re.sub(r'!\[Figure\s+\d+', '![Figure @INDEX', t)
+    t = re.sub(r'\.\./images/Figure\d+\.png', '../images/Figure@INDEX.png', t)
+    t = re.sub(r'\.\./tables/Table\d+\.md', '../tables/Table@INDEX.md', t)
+    t = re.sub(r'\.\./sections/[\d]+(?:\.[\d]+)*_\w+\.md', '../sections/@INDEX.md', t)
+    t = re.sub(r'\*Figure\s+\d+', '*Figure @INDEX', t)
+    t = re.sub(r'\bTable\s+\d+', 'Table @INDEX', t)
+    t = re.sub(r'\bFigure\s+\d+', 'Figure @INDEX', t)
+    t = re.sub(r'\bSection\s+[\d]+(?:\.[\d]+)*', 'Section @INDEX', t)
+    return t
+
+
+def _classify_differences(base_text: str, comp_text: str) -> list[str]:
+    base_full = _normalize_block(_normalize_indices(base_text))
+    comp_full = _normalize_block(_normalize_indices(comp_text))
+    if base_full != comp_full:
+        return ['content']
+    cats: list[str] = []
+    if _normalize_block(base_text) != _normalize_block(comp_text):
+        cats.append('index')
+    if (_normalize_block(_normalize_indices(base_text), apply_spelling=False) !=
+            _normalize_block(_normalize_indices(comp_text), apply_spelling=False)):
+        cats.append('spelling')
+    return cats
+
+
+def _unchanged_label(categories: list[str]) -> str | None:
+    if not categories or 'content' in categories:
+        return None
+    return 'Unchanged (besides ' + ', '.join(categories) + ')'
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Word-level diff
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _protect_urls(text: str) -> tuple[str, dict[str, str]]:
+    """Replace markdown links/images with placeholders so word-level
+    diffing never inserts ** or ~~ inside link syntax."""
+    url_map: dict[str, str] = {}
+    def _repl(m):
+        key = f'@URL_{len(url_map)}'; url_map[key] = m.group(0); return key
+    t = re.sub(r'!\[[^\]]*\]\([^)]+\)', _repl, text)
+    t = re.sub(r'\[[^\]]*\]\([^)]+\)', _repl, t)
+    return t, url_map
+
+
+def _restore_urls(text: str, url_map: dict[str, str]) -> str:
+    for key, orig in url_map.items():
+        text = text.replace(key, orig)
+    return text
 
 
 def _diff_words(base_text: str, comp_text: str) -> tuple[str, str]:
-    """Word-level diff between two texts, preserving line breaks.
-
-    Returns (annotated_base, annotated_comp) where:
-      - Words only in base are wrapped in **bold**
-      - Words only in comp are wrapped in ~~strikethrough~~
-      - Equal words are left unchanged.
-    """
-    base_lines = base_text.split('\n')
-    comp_lines = comp_text.split('\n')
-
-    # If either has multiple lines, diff line-by-line then join
-    if len(base_lines) > 1 or len(comp_lines) > 1:
-        # Align lines between the two texts
-        base_norm = [_normalize_block(l) for l in base_lines]
-        comp_norm = [_normalize_block(l) for l in comp_lines]
-        sm = SequenceMatcher(None, base_norm, comp_norm)
-
-        base_out: list[str] = []
-        comp_out: list[str] = []
+    """Word-level diff.  Replace → bold both; delete → bold base; insert → strike comp."""
+    bl = base_text.split('\n'); cl = comp_text.split('\n')
+    if len(bl) > 1 or len(cl) > 1:
+        bn = [_normalize_block(l) for l in bl]; cn = [_normalize_block(l) for l in cl]
+        sm = SequenceMatcher(None, bn, cn)
+        bo: list[str] = []; co: list[str] = []
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == 'equal':
-                base_out.extend(base_lines[i1:i2])
-                comp_out.extend(comp_lines[j1:j2])
+                bo.extend(bl[i1:i2]); co.extend(cl[j1:j2])
             elif tag == 'replace':
                 for k in range(max(i2 - i1, j2 - j1)):
-                    bt = base_lines[i1 + k] if k < i2 - i1 else ''
-                    ct = comp_lines[j1 + k] if k < j2 - j1 else ''
-                    if bt and ct:
-                        ab, ac = _diff_words(bt, ct)
-                        base_out.append(ab)
-                        comp_out.append(ac)
-                    elif bt:
-                        base_out.append('**' + bt + '**')
-                    elif ct:
-                        comp_out.append('~~' + ct + '~~')
+                    bt = bl[i1 + k] if k < i2 - i1 else ''
+                    ct = cl[j1 + k] if k < j2 - j1 else ''
+                    if bt and ct: ab, ac = _diff_words(bt, ct); bo.append(ab); co.append(ac)
+                    elif bt: bo.append('**' + bt + '**')
+                    elif ct: co.append('~~' + ct + '~~')
             elif tag == 'delete':
-                for k in range(i1, i2):
-                    base_out.append('**' + base_lines[k] + '**')
+                for k in range(i1, i2): bo.append('**' + bl[k] + '**')
             elif tag == 'insert':
-                for k in range(j1, j2):
-                    comp_out.append('~~' + comp_lines[k] + '~~')
-        return '\n'.join(base_out), '\n'.join(comp_out)
+                for k in range(j1, j2): co.append('~~' + cl[k] + '~~')
+        return '\n'.join(bo), '\n'.join(co)
 
-    # Single-line: word-level diff
-    base_words = re.findall(r'\S+', base_text)
-    comp_words = re.findall(r'\S+', comp_text)
+    bp, bu = _protect_urls(base_text); cp, cu = _protect_urls(comp_text)
+    bw = re.findall(r'\S+', bp); cw = re.findall(r'\S+', cp)
+    sm = SequenceMatcher(None, [w.lower() for w in bw], [w.lower() for w in cw])
+    bp_: list[str] = []; cp_: list[str] = []
 
-    sm = SequenceMatcher(None, [w.lower() for w in base_words],
-                         [w.lower() for w in comp_words])
+    def _strip_punct(w):
+        return re.sub(r'[),;:.]+$', '', w).lower()
 
-    base_parts: list[str] = []
-    comp_parts: list[str] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == 'equal':
-            base_parts.extend(base_words[i1:i2])
-            comp_parts.extend(comp_words[j1:j2])
+            bp_.extend(bw[i1:i2]); cp_.extend(cw[j1:j2])
         elif tag == 'replace':
-            base_parts.append('**' + ' '.join(base_words[i1:i2]) + '**')
-            comp_parts.append('~~' + ' '.join(comp_words[j1:j2]) + '~~')
+            # Word-by-word: only bold words that truly differ
+            n = max(i2 - i1, j2 - j1)
+            bp_sub = []; cp_sub = []
+            for k in range(n):
+                ba = bw[i1 + k] if k < i2 - i1 else ''
+                ca = cw[j1 + k] if k < j2 - j1 else ''
+                if not ba: cp_sub.append('~~' + ca + '~~')
+                elif not ca: bp_sub.append('**' + ba + '**')
+                elif _strip_punct(ba) == _strip_punct(ca):
+                    bp_sub.append(ba); cp_sub.append(ca)
+                else:
+                    bp_sub.append('**' + ba + '**')
+                    cp_sub.append('**' + ca + '**')
+            bp_.append(' '.join(bp_sub))
+            cp_.append(' '.join(cp_sub))
         elif tag == 'delete':
-            base_parts.append('**' + ' '.join(base_words[i1:i2]) + '**')
+            bp_.append('**' + ' '.join(bw[i1:i2]) + '**')
         elif tag == 'insert':
-            comp_parts.append('~~' + ' '.join(comp_words[j1:j2]) + '~~')
-
-    return ' '.join(base_parts), ' '.join(comp_parts)
-
-
-def _should_inline_diff(block: str) -> bool:
-    """Only inline-diff simple body paragraphs, not lists/headings/tables/code."""
-    if _is_heading(block) or _is_list(block):
-        return False
-    if block.startswith('```') or block.startswith('|') or block.startswith('!'):
-        return False
-    if block.startswith('>') or block.startswith('*'):
-        return False
-    # Reject blocks that contain list items or note blockquotes on any line
-    for line in block.split('\n'):
-        stripped = line.strip()
-        if re.match(r'^\d+\.\s', stripped):
-            return False
-        if re.match(r'^\s*[-*]\s', stripped):
-            return False
-        if stripped.startswith('>'):
-            return False
-    return True
+            cp_.append('~~' + ' '.join(cw[j1:j2]) + '~~')
+    return _restore_urls(' '.join(bp_), bu), _restore_urls(' '.join(cp_), cu)
 
 
-def _emit_comp_blocks(out: list[str], comp_blocks: list[str],
-                      comp_version: str = '') -> None:
-    """Append comparison blocks in blockquote format.
+# ═══════════════════════════════════════════════════════════════════════════════
+# List diff
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    A blank ``>`` line is inserted after the version annotation (and before
-    the first list item) so that markdown renderers recognise the list as
-    starting a new block.
-    """
-    if comp_version:
-        out.append(f'> **{comp_version}:**')
-    if comp_blocks and _is_list(comp_blocks[0]):
+def _split_marker(item: str) -> tuple[str, str]:
+    """Split a list item into (marker, content).  Marker includes indentation
+    and a trailing space so that ``1.Text`` becomes ``1. Text``."""
+    m = re.match(r'^(\s*(?:[-*] |\d+\. ))\s*(.*)', item, re.DOTALL)
+    if m:
+        return m.group(1), m.group(2)
+    return '', item
+
+
+def _diff_list(base_block: str, comp_block: str) -> tuple[list[str], list[str]]:
+    """Per-item diff of two list blocks.  Returns (base_out, comp_out).
+
+    - Same count: 1-to-1 pairing.
+    - One side empty: the other bolded / struck-through; caller adds a
+      single ``*New in this version*`` or ``**Removed**`` annotation.
+    - Different counts (both non-empty): SequenceMatcher aligns items;
+      gaps are filled with numbered ``*New in this version*`` (comp) or
+      ``**Removed in this version**`` (base) placeholders."""
+    bi = _split_list_items(base_block); ci = _split_list_items(comp_block)
+    # _split_list_items returns [''] for empty input — normalize
+    if len(bi) == 1 and not bi[0].strip(): bi = []
+    if len(ci) == 1 and not ci[0].strip(): ci = []
+    bo: list[str] = []; co: list[str] = []
+
+    # All new (comp empty) — bold base items
+    if not ci:
+        for item in bi:
+            bm, bt = _split_marker(item)
+            bo.append(bm + '**' + bt + '**')
+        return bo, []
+
+    # All deleted (base empty) — strikethrough comp items, base gets
+    # placeholders; caller adds single annotation
+    if not bi:
+        for item in ci:
+            cm, ct = _split_marker(item)
+            co.append(cm + '~~' + ct + '~~')
+        return bo, co
+
+    # Same count → 1-to-1
+    if len(bi) == len(ci):
+        for ba, ca in zip(bi, ci):
+            cats = _classify_differences(ba, ca)
+            if 'content' not in cats:
+                bo.append(ba); co.append(ca)
+            else:
+                bm, bt = _split_marker(ba)
+                cm, ct = _split_marker(ca)
+                ab, ac = _diff_words(bt, ct)
+                bo.append(bm + ab); co.append(cm + ac)
+        return bo, co
+
+    # Different counts → greedy matching: each comp item pairs with
+    # the best unmatched base item above threshold.  Remaining items
+    # get numbered placeholders in the base order.
+    SIM_THRESHOLD = 0.30
+    used_base: set[int] = set()
+    pairs: list[tuple[int, int]] = []  # (base_idx, comp_idx)
+    for j, c_item in enumerate(ci):
+        best_i = -1; best_sim = 0.0
+        cn2 = _normalize_block(c_item)
+        for i, b_item in enumerate(bi):
+            if i in used_base: continue
+            s = _block_similarity(b_item, c_item)
+            if s > best_sim:
+                best_sim = s; best_i = i
+        if best_sim >= SIM_THRESHOLD:
+            pairs.append((best_i, j))
+            used_base.add(best_i)
+    # Sort by base index so output follows base order
+    pairs.sort()
+    # Also track unmatched comp items
+    used_comp: set[int] = {j for _, j in pairs}
+
+    # Build output walking through base items in order
+    pi = 0  # index into pairs
+    for i, b_item in enumerate(bi):
+        if pi < len(pairs) and pairs[pi][0] == i:
+            # This base item has a comp match
+            j = pairs[pi][1]
+            c_item = ci[j]
+            cats = _classify_differences(b_item, c_item)
+            if 'content' not in cats:
+                bo.append(b_item); co.append(c_item)
+            else:
+                bm, bt = _split_marker(b_item)
+                cm, ct = _split_marker(c_item)
+                ab, ac = _diff_words(bt, ct)
+                bo.append(bm + ab)
+                co.append(bm + ac)
+            pi += 1
+        else:
+            # No comp match — this base item is new
+            bm, bt = _split_marker(b_item)
+            bo.append(bm + '**' + bt + '**')
+            co.append(bm + '*New in this version*')
+
+    # Append comp-only items at the end (deleted from base)
+    for j, c_item in enumerate(ci):
+        if j not in used_comp:
+            cm, ct = _split_marker(c_item)
+            co.append(cm + '~~' + ct + '~~')
+            bo.append(cm + '**Removed in this version**')
+    return bo, co
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Table diff
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _diff_table(base_block: str, comp_block: str) -> tuple[list[str], list[str]]:
+    """Per-cell diff of two tables expanded to max rows × max cols.
+
+    When data-row counts match, rows are paired 1-to-1.
+    When counts differ, SequenceMatcher finds the optimal alignment."""
+    br = base_block.strip().split('\n'); cr = comp_block.strip().split('\n')
+
+    def _sep(row):
+        return bool(re.match(r'^\|[ |\-:]+\|$', row))
+
+    def _cells(row):
+        parts = row.split('|')
+        if parts and parts[0].strip() == '': parts = parts[1:]
+        if parts and parts[-1].strip() == '': parts = parts[:-1]
+        return [c.strip() for c in parts]
+
+    bg, cg = [], []
+    bs, cs = set(), set()
+    for i, r in enumerate(br):
+        if _sep(r): bs.add(i)
+        else: bg.append(_cells(r))
+    for i, r in enumerate(cr):
+        if _sep(r): cs.add(i)
+        else: cg.append(_cells(r))
+
+    if not cg:
+        return [_rebuild([], br, bs)], []
+
+    max_c = max((len(row) for row in bg + cg), default=0)
+    for row in bg:
+        while len(row) < max_c: row.append('')
+    for row in cg:
+        while len(row) < max_c: row.append('')
+
+    def _rtext(row): return ' | '.join(row)
+    bt = [_rtext(r) for r in bg]; ct = [_rtext(r) for r in cg]
+
+    ab, ac = [], []
+    if len(bg) == len(cg):
+        # 1-to-1 row matching
+        for b_row, c_row in zip(bg, cg):
+            ab.append(list(b_row)); ac.append(list(c_row))
+    else:
+        bn = [_normalize_block(t) for t in bt]; cn = [_normalize_block(t) for t in ct]
+        sm = SequenceMatcher(None, bn, cn)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == 'equal':
+                for k in range(i2 - i1):
+                    ab.append(list(bg[i1 + k])); ac.append(list(cg[j1 + k]))
+            elif tag == 'replace':
+                n = min(i2 - i1, j2 - j1)
+                for k in range(n):
+                    ab.append(list(bg[i1 + k])); ac.append(list(cg[j1 + k]))
+                for k in range(n, i2 - i1):
+                    ab.append(list(bg[i1 + k])); ac.append(['__NEW__'] * max_c)
+                for k in range(n, j2 - j1):
+                    ab.append(['__DEL__'] * max_c); ac.append(list(cg[j1 + k]))
+            elif tag == 'delete':
+                for k in range(i2 - i1):
+                    ab.append(list(bg[i1 + k])); ac.append(['__NEW__'] * max_c)
+            elif tag == 'insert':
+                for k in range(j2 - j1):
+                    ab.append(['__DEL__'] * max_c); ac.append(list(cg[j1 + k]))
+
+    # Reconstruct output with separator rows in proper positions
+    def _rebuild(result_rows, orig_rows, sep_set):
+        final = []; di = 0
+        for i in range(len(orig_rows)):
+            if i in sep_set: final.append(orig_rows[i])
+            elif di < len(result_rows): final.append(result_rows[di]); di += 1
+        while di < len(result_rows): final.append(result_rows[di]); di += 1
+        if not any(_sep(r) for r in final) and final:
+            final.insert(1, '|' + '|'.join(['---'] * max_c) + '|')
+        return final
+
+    bo_rows, co_rows = [], []
+    for brow, crow in zip(ab, ac):
+        if crow and crow[0] == '__NEW__':
+            bo_rows.append('| ' + ' | '.join('**' + c + '**' for c in brow) + ' |')
+            cc = ['**New in this version**'] + [''] * (max_c - 1)
+            co_rows.append('| ' + ' | '.join(cc) + ' |')
+        elif brow and brow[0] == '__DEL__':
+            bc = ['**Removed in this version**'] + [''] * (max_c - 1)
+            bo_rows.append('| ' + ' | '.join(bc) + ' |')
+            # Per-cell strikethrough
+            cc = []
+            for c in crow:
+                cc.append('~~' + c + '~~' if c else '')
+            co_rows.append('| ' + ' | '.join(cc) + ' |')
+        else:
+            bcells, ccells = [], []
+            for ci in range(max_c):
+                b = brow[ci]; c = crow[ci]
+                if b == c: bcells.append(b); ccells.append(c)
+                elif not b and c: bcells.append(''); ccells.append('~~' + c + '~~')
+                elif b and not c: bcells.append('**' + b + '**'); ccells.append('')
+                else:
+                    cats = _classify_differences(b, c)
+                    if 'content' not in cats: bcells.append(b); ccells.append(c)
+                    else:
+                        abw, acw = _diff_words(b.strip(), c.strip())
+                        bcells.append(abw); ccells.append(acw)
+            bo_rows.append('| ' + ' | '.join(bcells) + ' |')
+            co_rows.append('| ' + ' | '.join(ccells) + ' |')
+
+    return (_rebuild(bo_rows, br, bs), _rebuild(co_rows, cr, cs))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Image pixel-diff helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compare_images(base_block: str, comp_block: str,
+                    base_dir: Path, comp_dir: Path) -> str | None:
+    m1 = re.search(r'!\[Figure\s+(\d+)', base_block)
+    m2 = re.search(r'!\[Figure\s+(\d+)', comp_block)
+    if not m1 or not m2: return None
+    p1 = base_dir / f'Figure{m1.group(1)}.png'
+    p2 = comp_dir / f'Figure{m2.group(1)}.png'
+    if not p1.exists() or not p2.exists(): return None
+    ratio, _, _, _ = diff_images(str(p1), str(p2))
+    return '*Changed (' + str(int(ratio)) + '% diff)*' if ratio >= 2.0 else '*Unchanged.*'
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Logging
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ComparisonLogger:
+    """Per-section synchronous log."""
+
+    def __init__(self, log_dir: Path):
+        self._dir = log_dir; self._fp = None; self._idx = 0
+
+    def start(self, filename: str, bc: int, cc: int) -> None:
+        name = filename + '_comparison.log'
+        os.makedirs(str(self._dir), exist_ok=True)
+        self._fp = open(str(self._dir / name), 'w', encoding='utf-8')
+        self._idx = 0
+        self._w(f'§{filename}')
+        self._w(f'base: {bc} blocks  comp: {cc} blocks')
+        self._w('')
+
+    def log(self, cat: str, verdict: str, base_preview: str,
+            comp_preview: str = '') -> None:
+        def _short(t):
+            t = t.replace('\n', ' ').strip()
+            return t[:90] + '...' if len(t) > 90 else t
+        self._w(f'[{self._idx:3d}] {cat:<15} | {verdict:<11} | {_short(base_preview)}')
+        if comp_preview:
+            self._w(f'      {"comp":<15} | {"":<11} | {_short(comp_preview)}')
+        self._idx += 1
+
+    def end(self) -> None:
+        if self._fp:
+            self._w(''); self._w('OK'); self._fp.close(); self._fp = None
+
+    def _w(self, line: str) -> None:
+        if self._fp: self._fp.write(line + '\n'); self._fp.flush()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Blockquote output helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _emit_comp(out: list[str], blocks: list[str], version: str = '') -> None:
+    if version: out.append(f'> **{version}:**')
+    if blocks and _is_list(blocks[0]): out.append('>')
+    for b in blocks:
+        for line in b.split('\n'): out.append(f'> {line}')
         out.append('>')
-    for block in comp_blocks:
-        for line in block.split('\n'):
-            out.append(f'> {line}')
-        out.append('>')
 
 
-def _interleave(base_blocks: list[str], comp_blocks: list[str],
-                comp_version: str = '') -> str:
-    """Align and interleave base and comparison blocks.
+def _heading_sibling_counts(blocks: list[str]) -> list[int]:
+    """For each heading, count siblings (same-level headings under the same
+    parent).  Non-heading blocks get 0.  Returns a list parallel to *blocks*."""
+    counts = [0] * len(blocks)
+    hidxs = [(i, len(re.match(r'^(#+)', blocks[i]).group(1)))
+             for i, b in enumerate(blocks) if _is_heading(b)]
+    for pos, (idx, level) in enumerate(hidxs):
+        # Find parent: nearest preceding heading with higher level
+        start = 0
+        for j in range(pos - 1, -1, -1):
+            if hidxs[j][1] < level:
+                start = hidxs[j][0]
+                break
+        # Find end: next heading with same or higher level after this sibling group
+        end = len(blocks)
+        for j in range(pos, len(hidxs)):
+            if hidxs[j][1] <= level and hidxs[j][0] > idx:
+                end = hidxs[j][0]
+                break
+        # Count same-level siblings in (start, end)
+        count = sum(1 for j in range(pos, len(hidxs))
+                    if hidxs[j][0] < end and hidxs[j][1] == level)
+        counts[idx] = count
+    return counts
 
-    Uses SequenceMatcher on normalized block text to find matching paragraphs,
-    then outputs each base block immediately followed by its comparison
-    counterpart (or a 'SAME' annotation for identical blocks).
-    """
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Central dispatch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _block_similarity(a: str, b: str) -> float:
+    """Trigram overlap between two normalized blocks (0-1), with word-Jaccard
+    fallback for blocks too short to form trigrams.
+
+    Index numbers (Table/Figure/Section) are normalized so they don't
+    break alignment of structurally identical blocks."""
+    na = _normalize_block(_normalize_indices(a))
+    nb = _normalize_block(_normalize_indices(b))
+    if na == nb:
+        return 1.0
+
+    def _tri(s):
+        words = s.split()
+        return set(tuple(words[i:i+3]) for i in range(len(words)-2))
+    ta = _tri(na); tb = _tri(nb)
+
+    if ta and tb:
+        return len(ta & tb) / len(ta | tb)
+
+    # Fall back to word Jaccard for texts too short for trigrams
+    wa = set(na.split()); wb = set(nb.split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
+                    comp_version: str,
+                    base_img_dir: Path | None,
+                    comp_img_dir: Path | None,
+                    log: ComparisonLogger | None) -> str:
+    """Count-first matching (paragraphs, figures): equal-length runs are
+    paired 1-to-1.  Lists and tables stay as whole blocks — _diff_list
+    and _diff_table handle per-item / per-row comparison internally."""
+
     if not comp_blocks:
-        # No comparison content — just output base blocks
         return '\n\n'.join(base_blocks) + '\n'
 
-    base_norm = [_normalize_block(b) for b in base_blocks]
-    comp_norm = [_normalize_block(b) for b in comp_blocks]
-
-    sm = SequenceMatcher(None, base_norm, comp_norm)
-    opcodes = sm.get_opcodes()
-
     out: list[str] = []
-    for tag, i1, i2, j1, j2 in opcodes:
+    bi, ci = 0, 0
+    blen, clen = len(base_blocks), len(comp_blocks)
+    LOOKAHEAD = 8
+    RESYNC_WINDOW = 15
+    THRESHOLDS = {
+        'heading':   0.85,
+        'paragraph': 0.40,
+        'list':      0.35,
+        'table':     0.40,
+        'figure':    0.70,
+    }
+    _label: str | None = None
+    bsib = _heading_sibling_counts(base_blocks)
+    csib = _heading_sibling_counts(comp_blocks)
+
+    def _emit(tag, b, c):
+        nonlocal out, _label
+        cat = _classify(b or c)
+
+        # Verdict
+        v_label = None
         if tag == 'equal':
-            # Unchanged blocks — show base, note as unchanged
-            for k in range(i1, i2):
-                block = base_blocks[k]
-                out.append(block)
-                if _is_list(block) or _is_heading(block):
-                    out.append('')
-                else:
-                    # Only mark multi-line / non-trivial blocks
-                    lines = block.split('\n')
-                    if len(lines) == 1:
-                        out.append('> *Unchanged.*')
-                    else:
-                        out.append('> *Unchanged.*')
-                    out.append('')
+            verdict = 'equal'
+        elif tag == 'new':
+            verdict = 'new'
+        elif tag == 'deleted':
+            verdict = 'deleted'
+        else:  # replace
+            if _normalize_block(b) == _normalize_block(c):
+                verdict = 'equal'
+            else:
+                cats = _classify_differences(b, c)
+                v_label = _unchanged_label(cats)
+                verdict = (v_label.replace('Unchanged (besides ', '')
+                          .replace(')', '') if v_label else 'diff')
+            if (cat == 'figure' and base_img_dir and comp_img_dir):
+                pix = _compare_images(b, c, base_img_dir, comp_img_dir)
+                if pix and pix != '*Unchanged.*':
+                    verdict = 'diff'
+        _label = v_label
+
+        # Log
+        if log:
+            if tag == 'deleted':
+                log.log(cat, verdict, '', c)
+            else:
+                log.log(cat, verdict, b, c if c else '')
+
+        # Emit
+        if tag == 'equal':
+            out.append(b)
+            if cat == 'heading':
+                out.append('')
+            elif cat == 'figure' and base_img_dir and comp_img_dir and c:
+                ann = _compare_images(b, c, base_img_dir, comp_img_dir)
+                _emit_comp(out, [ann or '*Unchanged.*'], comp_version)
+            elif cat == 'list':
+                out.append('')
+                _emit_comp(out, ['*Unchanged.*'], comp_version)
+            elif cat == 'table':
+                out.append('')
+                _emit_comp(out, ['*Unchanged.*'], comp_version)
+            else:
+                out.append('')
+                _emit_comp(out, ['*Unchanged.*'], comp_version)
 
         elif tag == 'replace':
-            # Try inline word-level diff for matching pairs within the group.
-            # Only applies when both sides are simple paragraphs.
-            base_range = list(range(i1, i2))
-            comp_range = list(range(j1, j2))
-            paired: set[int] = set()  # comp indices already consumed
-
-            for bi in base_range:
-                base_block = base_blocks[bi]
-                if not _should_inline_diff(base_block):
-                    out.append(base_block)
-                    out.append('')
-                    continue
-
-                # Find best-matching comp block
-                best_ci, best_sim = -1, 0.0
-                for ci in comp_range:
-                    if ci in paired:
-                        continue
-                    if not _should_inline_diff(comp_blocks[ci]):
-                        continue
-                    sim = SequenceMatcher(
-                        None, _normalize_block(base_block),
-                        _normalize_block(comp_blocks[ci])).ratio()
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_ci = ci
-
-                if best_ci >= 0 and best_sim > 0.3:
-                    paired.add(best_ci)
-                    annotated_base, annotated_comp = _diff_words(
-                        base_block, comp_blocks[best_ci])
-                    out.append(annotated_base)
-                    out.append('')
-                    _emit_comp_blocks(out, [annotated_comp], comp_version)
+            if cat == 'heading':
+                out.append(b); out.append('')
+                _emit_comp(out, [c], comp_version)
+            elif cat == 'list':
+                bo, co = _diff_list(b, c)
+                if bo: out.append('\n'.join(bo)); out.append('')
+                if co: _emit_comp(out, ['\n'.join(co)], comp_version)
+            elif cat == 'table':
+                bo, co = _diff_table(b, c)
+                if bo: out.append('\n'.join(bo)); out.append('')
+                if co: _emit_comp(out, ['\n'.join(co)], comp_version)
+            elif cat == 'figure':
+                out.append(b); out.append('')
+                if base_img_dir and comp_img_dir:
+                    pix = _compare_images(b, c, base_img_dir, comp_img_dir)
+                    if pix and pix != '*Unchanged.*':
+                        _emit_comp(out, [c, pix], comp_version)
+                    elif _label:
+                        _emit_comp(out, ['*' + _label + '*'], comp_version)
+                    else:
+                        _emit_comp(out, [c, pix or '*Unchanged.*'], comp_version)
+                elif _label:
+                    _emit_comp(out, ['*' + _label + '*'], comp_version)
                 else:
-                    out.append(base_block)
+                    _emit_comp(out, [c], comp_version)
+            else:  # paragraph
+                if _label:
+                    out.append(b); out.append('')
+                    _emit_comp(out, ['*' + _label + '*'], comp_version)
+                else:
+                    ab, ac = _diff_words(b, c)
+                    out.append(ab); out.append('')
+                    _emit_comp(out, [ac], comp_version)
+
+        elif tag == 'new':
+            if cat == 'heading':
+                out.append(b); out.append('')
+                _emit_comp(out, ['*New in this version*'], comp_version)
+            elif cat == 'list':
+                bo, _ = _diff_list(b, '')
+                if bo: out.append('\n'.join(bo)); out.append('')
+                _emit_comp(out, ['*New in this version*'], comp_version)
+            elif cat == 'table':
+                bo, _ = _diff_table(b, '')
+                if bo: out.append('\n'.join(bo)); out.append('')
+                _emit_comp(out, ['*New in this version*'], comp_version)
+            else:
+                for line in b.split('\n'):
+                    out.append('**' + line + '**')
+                out.append('')
+                _emit_comp(out, ['*New in this version*'], comp_version)
+
+        elif tag == 'deleted':
+            if cat == 'list':
+                bo, co = _diff_list('', c)
+                if not bo:
+                    # All-deleted — single annotation
+                    out.append('**Removed in this version**')
                     out.append('')
-
-            # Remaining unmatched comp blocks
-            unmatched = [ci for ci in comp_range if ci not in paired]
-            if unmatched:
-                unmatched_blocks = [comp_blocks[ci] for ci in unmatched]
-                _emit_comp_blocks(out, unmatched_blocks, comp_version)
-
-        elif tag == 'delete':
-            # Only in base (new content)
-            for k in range(i1, i2):
-                out.append(base_blocks[k])
+                else:
+                    out.append('\n'.join(bo)); out.append('')
+                if co: _emit_comp(out, ['\n'.join(co)], comp_version)
+                out.append('')
+            elif cat == 'table':
+                bo, co = _diff_table('', c)
+                if co: _emit_comp(out, ['\n'.join(co)], comp_version)
+                out.append('')
+            else:
+                lines = ['~~' + line + '~~' for line in c.split('\n')]
+                _emit_comp(out, ['\n'.join(lines)], comp_version)
                 out.append('')
 
-        elif tag == 'insert':
-            # Only in comparison (removed from base)
-            insert_blocks = [comp_blocks[k] for k in range(j1, j2)]
-            _emit_comp_blocks(out, insert_blocks, comp_version)
-            out.append('')
+    def _count_run(blocks, start, cat):
+        n = 0
+        for i in range(start, len(blocks)):
+            if _classify(blocks[i]) == cat: n += 1
+            else: break
+        return n
 
-    # Collapse runs of blank lines
+    def _fuzzy_lookahead() -> bool:
+        nonlocal bi, ci
+        lt = THRESHOLDS.get(comp_cat, 0.40)
+        for look in range(1, min(LOOKAHEAD, blen - bi)):
+            if _classify(base_blocks[bi + look]) != comp_cat: continue
+            if _block_similarity(base_blocks[bi + look],
+                                 comp_blocks[ci]) >= lt:
+                for i in range(bi, bi + look):
+                    _emit('new', base_blocks[i], '')
+                bi = bi + look
+                return True
+        lt = THRESHOLDS.get(base_cat, 0.40)
+        for look in range(1, min(LOOKAHEAD, clen - ci)):
+            if _classify(comp_blocks[ci + look]) != base_cat: continue
+            if _block_similarity(base_blocks[bi],
+                                 comp_blocks[ci + look]) >= lt:
+                for j in range(ci, ci + look):
+                    _emit('deleted', '', comp_blocks[j])
+                ci = ci + look
+                return True
+        for dist in range(1, RESYNC_WINDOW + 1):
+            for dx in range(dist + 1):
+                dy = dist - dx
+                bx2, cy2 = bi + dx, ci + dy
+                if bx2 >= blen or cy2 >= clen: continue
+                if dx == 0 and dy == 0: continue
+                bc2 = _classify(base_blocks[bx2])
+                cc2 = _classify(comp_blocks[cy2])
+                if bc2 != cc2: continue
+                th = THRESHOLDS.get(bc2, 0.40)
+                if _block_similarity(base_blocks[bx2],
+                                     comp_blocks[cy2]) >= th:
+                    for i in range(bi, bx2):
+                        _emit('new', base_blocks[i], '')
+                    for j in range(ci, cy2):
+                        _emit('deleted', '', comp_blocks[j])
+                    bi, ci = bx2, cy2
+                    return True
+        for i in range(bi, blen):
+            _emit('new', base_blocks[i], '')
+        for j in range(ci, clen):
+            _emit('deleted', '', comp_blocks[j])
+        bi, ci = blen, clen
+        return False
+
+    while bi < blen or ci < clen:
+        if bi >= blen:
+            if ci < clen:
+                out.append('**Removed in this version**')
+                out.append('')
+                out.append(f'> **{comp_version}:**')
+                for j in range(ci, clen):
+                    c = comp_blocks[j]
+                    cat = _classify(c)
+                    if cat == 'table':
+                        _, co = _diff_table('', c)
+                        for row in co:
+                            for line in row.split('\n'):
+                                out.append(f'> {line}')
+                        out.append('>')
+                    elif cat == 'list':
+                        _, co = _diff_list('', c)
+                        out.append('>')
+                        for item in co:
+                            for line in item.split('\n'):
+                                out.append(f'> {line}')
+                            out.append('>')
+                    else:
+                        for line in c.split('\n'):
+                            out.append(f'> ~~{line}~~')
+                        out.append('>')
+            break
+        if ci >= clen:
+            for i in range(bi, blen):
+                _emit('new', base_blocks[i], '')
+            break
+
+        base_cat = _classify(base_blocks[bi])
+        comp_cat = _classify(comp_blocks[ci])
+
+        if base_cat != comp_cat:
+            _fuzzy_lookahead()
+            continue
+
+        # Count-first: equal-length runs of paragraphs / figures
+        # (not headings — solitary by nature; not lists/tables — single
+        # blocks whose internal counts are handled by _diff_list/_diff_table)
+        if base_cat in ('paragraph', 'figure'):
+            bc = _count_run(base_blocks, bi, base_cat)
+            cc = _count_run(comp_blocks, ci, comp_cat)
+            if bc == cc:
+                for k in range(bc):
+                    b_blk = base_blocks[bi + k]; c_blk = comp_blocks[ci + k]
+                    tag = 'equal' if _normalize_block(b_blk) == _normalize_block(c_blk) else 'replace'
+                    _emit(tag, b_blk, c_blk)
+                bi += bc; ci += cc
+                continue
+
+        # Heading sibling-match
+        if base_cat == 'heading':
+            blv = len(re.match(r'^(#+)', base_blocks[bi]).group(1))
+            clv = len(re.match(r'^(#+)', comp_blocks[ci]).group(1))
+            if blv == clv and bsib[bi] > 0 and bsib[bi] == csib[ci]:
+                b_blk = base_blocks[bi]; c_blk = comp_blocks[ci]
+                tag = 'equal' if _normalize_block(b_blk) == _normalize_block(c_blk) else 'replace'
+                _emit(tag, b_blk, c_blk)
+                bi += 1; ci += 1
+                continue
+
+        # Similarity match
+        sim = _block_similarity(base_blocks[bi], comp_blocks[ci])
+        threshold = THRESHOLDS.get(base_cat, 0.40)
+        if sim >= threshold:
+            tag = 'equal' if _normalize_block(base_blocks[bi]) == _normalize_block(comp_blocks[ci]) else 'replace'
+            _emit(tag, base_blocks[bi], comp_blocks[ci])
+            bi += 1; ci += 1
+            continue
+
+        _fuzzy_lookahead()
+
+    # Collapse blank-line runs
     result: list[str] = []
-    blank_count = 0
+    blc = 0
     for line in out:
         if line == '' or line == '>':
-            blank_count += 1
-            if blank_count <= 2:
-                result.append(line)
+            blc += 1
+            if blc <= 2: result.append(line)
         else:
-            blank_count = 0
-            result.append(line)
-
+            blc = 0; result.append(line)
     return '\n'.join(result).strip() + '\n'
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Asset helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _rewrite_assets(text: str, bv: str, cv: str) -> str:
+    result: list[str] = []
+    for line in text.split('\n'):
+        ver = cv if line.startswith('> ') else bv
+        line = re.sub(r'(\.\./images/Figure\d+)(\.png)', rf'\1_{ver}\2', line)
+        line = re.sub(r'(\.\./tables/Table\d+)(\.md)', rf'\1_{ver}\2', line)
+        result.append(line)
+    return '\n'.join(result)
+
+
+def _copy_assets(text: str,
+                 b_img: Path, b_tbl: Path,
+                 c_img: Path, c_tbl: Path,
+                 comp_dir: Path, bv: str, cv: str) -> None:
+    import shutil
+    for sub in ('images', 'tables'):
+        (comp_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    def _cp(line, is_comp, kind, ext):
+        ver = cv if is_comp else bv
+        sd = (c_img if is_comp else b_img) if kind == 'images' else (c_tbl if is_comp else b_tbl)
+        for m in re.finditer(rf'\.\./{kind}/(\w+)(\{ext})', line):
+            name, suf = m.group(1), m.group(2)
+            dest = comp_dir / kind / f'{name}_{ver}{suf}'
+            if not dest.exists():
+                src = sd / f'{name}{suf}'
+                if src.exists(): shutil.copy2(str(src), str(dest))
+
+    for line in text.split('\n'):
+        _cp(line, line.startswith('> '), 'images', '.png')
+        _cp(line, line.startswith('> '), 'tables', '.md')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Build & main
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_report(report_path: Path) -> list[str]:
+    with open(report_path, encoding='utf-8') as f:
+        content = f.read()
+    return [m.group(1) for m in re.finditer(r'\|\s*✓\s*\|\s*([\d.]+)\s*\|', content)]
+
+
+def find_counterpart(num: str, mapping: list[dict]) -> dict | None:
+    for m in mapping:
+        if m.get('base_num') == num: return m
+    return None
+
+
+def read_section_file(sections_dir: Path, num: str) -> str | None:
+    prefix = f'{num}_'
+    for f in sorted(sections_dir.iterdir()):
+        if f.name.startswith(prefix) and f.suffix == '.md':
+            return f.read_text(encoding='utf-8')
+    return None
 
 
 def build_comparison(base_content: str, comp_num: str | None,
                      comp_heading: str | None, comp_content: str | None,
-                     kind: str | None, comp_version: str = '') -> str:
-    """Create an interleaved comparison file."""
+                     kind: str | None, comp_version: str = '',
+                     base_img_dir: Path | None = None,
+                     comp_img_dir: Path | None = None,
+                     log: ComparisonLogger | None = None) -> str:
     lines: list[str] = []
-
-    # Mapping annotation header
     if kind == 'new_section' or comp_num is None:
-        lines.append('> **New in this version**')
-        lines.append('>')
+        lines.append('> **New in this version**'); lines.append('>')
     elif kind == 'deleted_in_base':
         lines.append(f'> **Removed from this version (was comparison §{comp_num or "?"})**')
         lines.append('>')
     elif comp_num:
-        lines.append(f'> **Mapped from comparison §{comp_num}**')
-        lines.append('>')
-
+        lines.append(f'> **Mapped from comparison §{comp_num}**'); lines.append('>')
     lines.append('')
 
     if not comp_content:
-        # No comparison counterpart — just output base content
         lines.append(base_content.strip())
         if comp_num:
             lines.append('')
-            lines.append(f'> **Comparison §{comp_num}**{f" — {comp_heading}" if comp_heading else ""}')
+            lines.append(f'> **Comparison §{comp_num}**'
+                         f'{f" — {comp_heading}" if comp_heading else ""}')
             lines.append('>')
             lines.append('> *(Comparison section not yet extracted. Run extract_all.py first.)*')
             lines.append('>')
         return '\n'.join(lines) + '\n'
 
-    # Interleave base and comparison blocks
+    base_content = _strip_blockquotes(base_content)
+    comp_content = _strip_blockquotes(comp_content)
     base_blocks = _split_blocks(base_content)
     comp_blocks = _split_blocks(comp_content)
 
-    interleaved = _interleave(base_blocks, comp_blocks, comp_version)
+    # Split body paragraphs into individual blocks; lists and tables stay whole
+    base_blocks = _split_all(base_blocks)
+    comp_blocks = _split_all(comp_blocks)
 
+    base_blocks = _merge_split_numbered_lists(base_blocks)
+    comp_blocks = _merge_split_numbered_lists(comp_blocks)
+
+    interleaved = _process_blocks(base_blocks, comp_blocks, comp_version,
+                                  base_img_dir, comp_img_dir, log)
     lines.append(interleaved)
-
-    # Footer with comparison reference
     lines.append('')
-    lines.append(f'> **Comparison §{comp_num}**{f" — {comp_heading}" if comp_heading else ""}')
+    lines.append(f'> **Comparison §{comp_num}**'
+                 f'{f" — {comp_heading}" if comp_heading else ""}')
     lines.append('>')
-
     return '\n'.join(lines) + '\n'
 
 
 def main():
     cfg = load_config()
-
-    mapping = []
-    if cfg.mapping_file.exists():
-        with open(cfg.mapping_file, encoding='utf-8') as f:
-            mapping = json.load(f)
+    if not cfg.mapping_file.exists():
+        print(f'ERROR: Mapping file not found: {cfg.mapping_file}')
+        print('Run extract_all.py first to generate the mapping.')
+        sys.exit(1)
+    with open(cfg.mapping_file, encoding='utf-8') as f:
+        mapping = json.load(f)
 
     if len(sys.argv) >= 2:
-        report_path = Path(sys.argv[1])
-        if not report_path.is_absolute():
-            report_path = ROOT / report_path
-        section_nums = parse_report(report_path)
-        print(f'Parsed {len(section_nums)} checked sections from {report_path.name}')
+        rp = Path(sys.argv[1])
+        if not rp.is_absolute(): rp = ROOT / rp
+        section_nums = parse_report(rp)
+        print(f'Parsed {len(section_nums)} checked sections from {rp.name}')
     else:
         section_nums = [m['base_num'] for m in mapping
                         if m.get('base_num') and m.get('kind') != 'deleted_in_base']
         print(f'Comparing all {len(section_nums)} mapped sections')
 
     if not section_nums:
-        print('No sections to compare.')
-        return
+        print('No sections to compare.'); return
 
-    comp_sections_dir = cfg.comparison_dir / 'sections'
-    os.makedirs(str(comp_sections_dir), exist_ok=True)
+    out_dir = cfg.comparison_dir / 'sections'
+    os.makedirs(str(out_dir), exist_ok=True)
 
     created = 0
+    log = ComparisonLogger(out_dir)
     for num in section_nums:
-        base_content = read_section_file(cfg.base.sections_dir, num)
-        if base_content is None:
-            print(f'  SKIP §{num}: not found in base sections')
-            continue
+        bc = read_section_file(cfg.base.sections_dir, num)
+        if bc is None:
+            print(f'  SKIP §{num}: not found in base sections'); continue
 
         m = find_counterpart(num, mapping)
-        comp_num = m['comp_num'] if m else None
-        comp_heading = m['comp_heading'] if m else None
-        kind = m['kind'] if m else None
+        cn = m['comp_num'] if m else None
+        ch = m['comp_heading'] if m else None
+        kd = m['kind'] if m else None
+        cc = read_section_file(cfg.comparison.sections_dir, cn) if cn else None
 
-        comp_content = None
-        if comp_num:
-            comp_content = read_section_file(cfg.comparison.sections_dir, comp_num)
-
-        comp_ver_display = cfg.comparison.version.replace('p', '.')
-        comparison_text = build_comparison(base_content, comp_num, comp_heading,
-                                           comp_content, kind, comp_ver_display)
-
-        base_filename = None
+        # Determine output filename first
+        fn = None
         for f in cfg.base.sections_dir.iterdir():
             if f.name.startswith(f'{num}_') and f.suffix == '.md':
-                base_filename = f.name.replace('.md', '_comparison.md')
-                break
+                fn = f.name.replace('.md', '_comparison.md'); break
+        if fn is None: fn = f'{num}_comparison.md'
 
-        if base_filename is None:
-            base_filename = f'{num}_comparison.md'
+        log.start(fn.replace('_comparison.md', ''),
+                  len(_split_blocks(bc)),
+                  len(_split_blocks(cc)) if cc else 0)
 
-        out_path = comp_sections_dir / base_filename
-        out_path.write_text(comparison_text, encoding='utf-8')
+        cv = cfg.comparison.version.replace('p', '.')
+        text = build_comparison(bc, cn, ch, cc, kd, cv,
+                                base_img_dir=cfg.base.images_dir,
+                                comp_img_dir=cfg.comparison.images_dir,
+                                log=log)
+
+        _copy_assets(text,
+                     cfg.base.images_dir, cfg.base.tables_dir,
+                     cfg.comparison.images_dir, cfg.comparison.tables_dir,
+                     cfg.comparison_dir, cfg.base.version, cfg.comparison.version)
+        text = _rewrite_assets(text, cfg.base.version, cfg.comparison.version)
+        (out_dir / fn).write_text(text, encoding='utf-8')
         created += 1
+        log.end()
 
-    print(f'Created {created} comparison files in {comp_sections_dir.relative_to(ROOT)}')
+    print(f'Created {created} comparison files in {out_dir.relative_to(ROOT)}')
 
 
 if __name__ == '__main__':

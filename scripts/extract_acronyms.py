@@ -44,7 +44,7 @@ from lxml import etree
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'scripts'))
 
-from common import W, NS, DEFINITION_STYLES, parse_toc, para_to_markdown
+from common import W, NS, DEFINITION_STYLES, build_style_map, parse_toc, para_to_markdown
 
 
 def _para_runs(p_elem):
@@ -59,13 +59,9 @@ def _para_runs(p_elem):
 
 def _is_acronym_run(text: str) -> bool:
     """A run belongs to the acronym if every character is uppercase, digit,
-    slash, or underscore.  Lowercase acronyms like 'rms' are also recognised
-    when short and followed by another word."""
-    if re.match(r'^[A-Z0-9/_]+$', text):
-        return True
-    if re.match(r'^[a-z]+$', text) and len(text) <= 5:
-        return True
-    return False
+    slash, or underscore.  Lowercase acronyms are handled by the fallback
+    in _split_acronym (first run is used when no run matches)."""
+    return bool(re.match(r'^[A-Z0-9/_]+$', text))
 
 
 def _split_acronym(runs: list[str]) -> tuple[str, str]:
@@ -99,7 +95,6 @@ def extract_acronyms(docx_path: str) -> dict[str, str]:
     body = root.find(f'{{{W}}}body')
 
     num_to_heading, heading_to_num = parse_toc(doc_xml)
-    from common import build_style_map
     style_map = build_style_map(styles_xml)
 
     # Find the heading element in the body by matching the heading text

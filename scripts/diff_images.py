@@ -41,27 +41,26 @@ def diff_images(path1, path2, threshold=30):
     img1 = Image.open(path1).convert('RGB')
     img2 = Image.open(path2).convert('RGB')
 
-    # Resize to same height, compare at overlapping width
-    h = min(img1.height, img2.height)
+    # Resize both to a common size so pixels align 1:1.
+    # Using the average dimensions avoids cropping either image and
+    # prevents false-positive diffs caused by independent resize+ crop.
+    h = (img1.height + img2.height) // 2
     w1 = int(img1.width * h / img1.height)
     w2 = int(img2.width * h / img2.height)
+    w = (w1 + w2) // 2
 
-    img1_r = img1.resize((w1, h), Image.LANCZOS)
-    img2_r = img2.resize((w2, h), Image.LANCZOS)
+    img1_r = img1.resize((w, h), Image.LANCZOS)
+    img2_r = img2.resize((w, h), Image.LANCZOS)
 
-    w = min(w1, w2)
-    img1_c = img1_r.crop((0, 0, w, h))
-    img2_c = img2_r.crop((0, 0, w, h))
-
-    a1 = np.array(img1_c)
-    a2 = np.array(img2_c)
+    a1 = np.array(img1_r)
+    a2 = np.array(img2_r)
 
     diff = np.sqrt(np.sum((a1.astype(float) - a2.astype(float)) ** 2, axis=2))
     diff_pixels = np.sum(diff > threshold)
     ratio = diff_pixels / diff.size * 100
     mean_dist = np.mean(diff)
 
-    return ratio, mean_dist, img1_c, diff
+    return ratio, mean_dist, img1_r, diff
 
 
 def generate_diff_overlay(base_img, diff, threshold, output_path):

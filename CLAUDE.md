@@ -150,20 +150,39 @@ JSON field names use `base_`/`comp_` prefixes: `base_num`, `comp_num`, `base_hea
 
 ### search_sections.py
 
-Full-text search in the base docx body text. Word-level matching with prefix
-support (sequence ↔ sequences). AND semantics: all query words must match.
+Full-text search in the base docx body text. Outputs a checklist of **all** sections
+in the document, with matching sections pre-checked (`✓`).
 
-If `acronyms.json` exists in the base index, queries are expanded bidirectionally:
-searching "UAJ" also matches "Universal Audio Jack" sections, and searching
-"Universal Audio Jack" also matches sections that only mention "UAJ".
+Three modes:
+
+**Default (AND word match):** Word-level matching with prefix support
+(sequence ↔ sequences). AND semantics: all query words must match.
+Acronym expansion if `acronyms.json` exists.
 
 ```
 python -X utf8 scripts/search_sections.py "<keyword>"
 ```
 
-Output: Markdown table with `✓` checkboxes, saved to `<comparison_dir>/index/<keyword>.md`. Columns: `Compare?`, `Section`, `Heading`, `Matches`.
+**Phrase mode:** Query words must appear consecutively in the section text.
+Each word matched with prefix support (handling Function↔Functions).
+No acronym expansion.
 
-Remove `✓` from unwanted rows to exclude sections from comparison.
+```
+python -X utf8 scripts/search_sections.py --phrase "<phrase>"
+```
+
+**Section mode:** No text search — output the full checklist with only the
+specified section number pre-checked.
+
+```
+python -X utf8 scripts/search_sections.py --section <num>
+```
+
+Output: Markdown table with columns `Compare?`, `Section`, `Heading`, `Matches`.
+Saved to `<comparison_dir>/index/<keyword>.md` (or `section_<num>.md` for `--section`).
+
+Remove `✓` from unwanted rows, or add `✓` to additional sections, before running
+`compare_sections.py`.
 
 ### compare_sections.py
 
@@ -175,13 +194,72 @@ python -X utf8 scripts/compare_sections.py <report.md>
 
 If `<report.md>` is omitted, compares ALL sections from the mapping.
 
-For each checked section:
-- Splits base and comparison content into logical blocks (paragraphs, lists, headings, etc.)
-- Aligns blocks by content similarity using `SequenceMatcher`
-- Interleaves: each base block is immediately followed by its comparison counterpart in blockquotes
-- Body paragraphs get word-level inline diffs: **bold** for new/changed text, ~~strikethrough~~ for old text
-- Lists, headings, tables, and code blocks are shown as-is (no inline diff)
-- Annotation header shows mapping info (`Mapped from comparison §X.Y`, `New in this version`, etc.)
+For each checked section, blocks follow this pipeline:
+
+1. **Strip blockquotes** — `_strip_blockquotes`: join consecutive `> ` lines into single
+   paragraphs so notes don't get split across blocks.
+2. **Split** — `_split_blocks` then `_split_all` (`_split_paragraphs`): break content into
+   logical blocks. Lists and tables stay as whole blocks.
+3. **Merge split lists** — `_merge_split_numbered_lists`: reassemble numbered list fragments
+   that were split by intervening non-heading blocks (tables, figures, notes). Two numbered
+   lists are merged when the last item at the first-item-of-List-B's indentation level in
+   List A has a consecutive number (N+1=M). Iterates until stable. Bullet lists (-/*) are
+   not merged.
+4. **Classify** — `_classify(block)` → heading / list / table / figure / paragraph
+5. **Normalize** — `_normalize_block` (lowercase, strip markdown, apply spelling variants) +
+   `_normalize_indices` (replace Table/Figure/Section numbers with @INDEX placeholders)
+6. **Compare** — `_process_blocks`: dispatch to the appropriate handler based on classification
+
+**Matching order** (first match wins, evaluated per iteration):
+
+1. **Count-first** (paragraphs, figures): equal-length consecutive runs of same-category
+   blocks are paired 1-to-1. Applied before other strategies.
+2. **Heading sibling-match**: same-level headings under the same parent, with matching
+   sibling counts, are paired regardless of content similarity.
+3. **Similarity match**: `_block_similarity` — trigram overlap with word-Jaccard fallback
+   for texts too short to form trigrams. Index numbers (Table/Figure/Section) are
+   normalized BEFORE `_normalize_block` so number differences don't break alignment.
+4. **Fuzzy lookahead** (8 blocks): when the current pair is different categories or below
+   threshold, search ahead for a matching block of the same category.
+5. **Resynchronization** (Manhattan distance, window=15): find the closest (dx,dy) where
+   blocks match by category and similarity. Batch-emit unmatched blocks as NEW/DELETED
+   to avoid ping-pong shredding of multi-block insertions. Falls through to emitting all
+   remaining blocks as NEW/DELETED if no resync point is found.
+
+**Block-type-specific thresholds** (trigram overlap, 0–1):
+- **heading**: 0.85 — short text, easy false positives
+- **list**: 0.35 — structured content; internal count-first and greedy matching handle most cases
+- **table**: 0.40 — structured content; internal row-matching handles most cases
+- **figure**: 0.70 — captions are short, false positives common
+- **paragraph**: 0.40 — longer text warrants some tolerance
+
+**Processing and logging are always synchronized** — every emit() call produces exactly one
+log entry with the same verdict, so the log faithfully mirrors the output file.
+
+Diff rules:
+- **equal**: base as-is, comp `*Unchanged.*`
+- **index/spelling only**: base as-is, comp `*Unchanged (besides index, spelling)*`
+- **content changed**: both base and comp get **bold** on differing words
+- **new in base**: base **bold**, comp `*New in this version*`
+- **deleted from base**: comp ~~strikethrough~~
+
+Specialized handlers:
+- **Lists**: per-item diffs (via `_diff_list`). When one side is empty, all items bolded/
+  struck-through with a single annotation. Same count → 1-to-1 pairing with per-item word
+  diff. Different counts → greedy matching: each comp item pairs with the best unmatched
+  base item above threshold (0.30); remaining items get numbered placeholders. Two complete
+  lists shown (base first, then comparison as one blockquote). Blank `>` line before first
+  list item.
+- **Tables**: per-cell diffs (via `_diff_table`). Expanded to max(rows)×max(cols). Same row
+  count → 1-to-1. Different counts → SequenceMatcher alignment. New rows: `**New in this version**`
+  row marker + per-cell bold. Deleted rows: `**Removed in this version**` row marker + per-cell
+  ~~strikethrough~~ (never whole-row ~~). New/deleted cells within matched rows get per-cell
+  bold/strikethrough.
+- **Figures**: pixel-diffed via `diff_images.py`. If unchanged, treated like index-only.
+- **Headings**: shown as-is, no inline annotation.
+
+Logging: per-section log written synchronously to `comparison_*/sections/<num>_<heading>_comparison.log`.
+Annotation header shows mapping info (`Mapped from comparison §X.Y`, `New in this version`, etc.)
 
 Generated file format (interleaved — comparison blocks follow their base counterparts):
 ```
@@ -202,6 +280,7 @@ Generated file format (interleaved — comparison blocks follow their base count
 Each comparison block is prefixed with `> **vX.Y:**` showing the comparison version
 (with `.` replacing the internal `p` separator, e.g. `v1p0` → `v1.0`).
 Blocks that are identical between versions are annotated `> *Unchanged.*`.
+Blocks whose only difference is table/figure/section number changes are annotated `> *Unchanged (besides index)*`.
 
 **Blank-line-before-list rule**: When a comparison blockquote contains a list
 (numbered or bullet), a blank `>` line MUST precede the first list item
@@ -259,8 +338,8 @@ doc/
     (same structure)
   comparison_<base>_<comp>/             # Interleaved comparison files
     sections/                           # <num>_<heading>_comparison.md
-    tables/                             # (reserved for table diffs)
-    images/                             # (reserved for image diffs)
+    tables/                             # copied from output dirs with version suffix (Table1_v1p0.md)
+    images/                             # copied from output dirs with version suffix (Figure1_v1p0.png)
     index/                              # mapping + search reports + fingerprints
 scripts/
   common.py                             # Shared OOXML utilities and markdown rendering
@@ -269,7 +348,7 @@ scripts/
   init_config.py                        # Stage 1.1: discover versions, generate config
   extract_all.py                        # Stage 1.2+1.3: full extraction pipeline
   extract_index.py                      # Build master index
-  extract_section.py                    # Extract single section
+  extract_section.py                    # Extract single section or all sections (--all)
   extract_acronyms.py                   # Parse acronyms from section 2.4
   extract_figure.py                     # Extract single figure
   extract_table.py                      # Extract single table
