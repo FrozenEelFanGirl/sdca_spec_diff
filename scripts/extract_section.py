@@ -228,10 +228,24 @@ def extract_sections(docx_path, output_dir, index_path=None):
         with open(index_path, 'r', encoding='utf-8') as f:
             index_data = json.load(f)
 
+    def _normalize_heading(h):
+        """Normalize heading text for robust comparison."""
+        h = h.replace(r'\<', '<').replace(r'\>', '>').replace(r'\*', '*')
+        h = re.sub(r'#\s+(\d)', r'#\1', h)
+        h = re.sub(r'\s+', ' ', h)
+        h = h.replace('–', '-').replace('—', '-').lower()
+        h = re.sub(r'^[\dA-Z\.]+\s*', '', h).strip()
+        return h
+
+    # Pre-normalize TOC headings
+    toc_norm = {num: _normalize_heading(h) for num, h in num_to_heading.items()}
+
     # Find all heading elements and their positions in the body
     heading_positions = []  # (child_index, section_num, heading_text, level)
     body_children = list(body)
     toc_matched: set[str] = set()  # track TOC entries already consumed
+    unmatched_body = []  # (idx, text, lvl, h_norm) — body headings not yet matched
+
     for idx, child in enumerate(body_children):
         if child.tag != f'{{{W}}}p':
             continue
@@ -248,27 +262,58 @@ def extract_sections(docx_path, output_dir, index_path=None):
         text = para_to_markdown(child).strip()
         if not text:
             continue
-        h_norm = text.lower().replace('–', '-').replace('—', '-')
-        h_norm = re.sub(r'^[\dA-Z\.]+\s*', '', h_norm).strip()
+        h_norm = _normalize_heading(text)
         section_num = None
-        for num, heading in num_to_heading.items():
+        for num, tn in toc_norm.items():
             if num in toc_matched:
                 continue
-            nh = heading.lower().replace('–', '-').replace('—', '-')
-            nh = re.sub(r'^[\dA-Z\.]+\s*', '', nh).strip()
-            if nh == h_norm:
+            if tn == h_norm:
                 section_num = num
                 toc_matched.add(num)
                 break
         if section_num:
             heading_positions.append((idx, section_num, text, lvl))
+        else:
+            unmatched_body.append((idx, text, lvl, h_norm))
+
+    # Second pass: for unmatched TOC entries, try prefix match
+    # or section-number-in-heading-text against unmatched body headings.
+    unmatched_toc = [(num, tn) for num, tn in toc_norm.items()
+                     if num not in toc_matched]
+    for num, tn in unmatched_toc:
+        best = None
+        for bi, (idx, text, lvl, h_norm) in enumerate(unmatched_body):
+            # Prefix match: TOC heading is a prefix of body heading
+            # (handles parse_toc regex truncating trailing digits, e.g.
+            #  "Microphone Geometry Reported in IT" vs "... IT11")
+            if h_norm.startswith(tn) and len(tn) >= len(h_norm) * 0.6:
+                best = (bi, idx, num, text, lvl)
+                break
+            # Section number extracted from heading text matches TOC
+            m = re.match(r'^([\d]+(?:\.[\d]+)*)\s', text)
+            if m and m.group(1) == num:
+                best = (bi, idx, num, text, lvl)
+                break
+        if best is not None:
+            bi, idx, num, text, lvl = best
+            heading_positions.append((idx, num, text, lvl))
+            toc_matched.add(num)
+            del unmatched_body[bi]
+
+    # Third pass: remaining body headings with section numbers not in TOC
+    for idx, text, lvl, h_norm in unmatched_body:
+        m = re.match(r'^([\d]+(?:\.[\d]+)*)\s', text)
+        if m:
+            heading_positions.append((idx, m.group(1), text, lvl))
 
     section_to_pos = {}
     for pos_idx, (child_idx, section_num, heading_text, lvl) in enumerate(heading_positions):
         section_to_pos[section_num] = pos_idx
 
     extracted_count = 0
-    all_section_nums = sorted(num_to_heading.keys(), key=sort_key)
+    all_section_nums = sorted(
+        set(list(num_to_heading.keys()) + [sn for _, sn, _, _ in heading_positions]),
+        key=sort_key)
 
     for section_num in all_section_nums:
         if section_num not in section_to_pos:

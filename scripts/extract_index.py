@@ -68,7 +68,16 @@ def build_index(docx_path):
 
     # Also scan body paragraphs for headings not captured by the TOC
     style_map = build_style_map(styles_xml)
-    toc_headings_lower = {h.lower() for h in num_to_heading.values()}
+
+    def _normalize_heading(h):
+        h = h.replace(r'\<', '<').replace(r'\>', '>').replace(r'\*', '*')
+        h = re.sub(r'#\s+(\d)', r'#\1', h)
+        h = re.sub(r'\s+', ' ', h)
+        h = h.replace('–', '-').replace('—', '-').lower()
+        h = re.sub(r'^[\dA-Z\.]+\s*', '', h).strip()
+        return h
+
+    toc_norm_set = {_normalize_heading(h) for h in num_to_heading.values()}
 
     for child in body:
         if child.tag != f'{{{W}}}p':
@@ -93,8 +102,7 @@ def build_index(docx_path):
             continue
 
         # Skip if this heading text is already covered by a TOC entry
-        h_normalized = re.sub(r'^[\dA-Z\.]+\s*', '', text).strip().lower()
-        if h_normalized in toc_headings_lower:
+        if _normalize_heading(text) in toc_norm_set:
             continue
 
         # Only add headings with a recognizable section number
