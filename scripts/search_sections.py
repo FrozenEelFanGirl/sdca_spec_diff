@@ -36,10 +36,10 @@ import zipfile
 from pathlib import Path
 from lxml import etree
 
-from common import W, NS, parse_toc, build_style_map, sort_key
+from common import W, NS, parse_toc, build_style_map, sort_key, parse_xml
 
-ROOT = Path(__file__).resolve().parent.parent
-DOC = ROOT / 'doc'
+from config import ROOT  # noqa: E402
+DOC = os.path.join(ROOT, 'doc')
 
 
 def _resolve_docx_and_out():
@@ -208,7 +208,7 @@ def _parse_docx(docx_path: Path):
     styles_xml = z.read('word/styles.xml')
     style_map = build_style_map(styles_xml)
     doc_xml = z.read('word/document.xml')
-    root = etree.fromstring(doc_xml)
+    root = parse_xml(doc_xml)
     body = root.find(f'{{{W}}}body')
 
     num_to_heading, _ = parse_toc(doc_xml)

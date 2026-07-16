@@ -37,7 +37,7 @@ import zipfile
 from lxml import etree
 from PIL import Image
 
-from common import W, R, VML, parse_rels
+from common import W, R, VML, parse_rels, parse_xml
 
 R_NS = R  # alias for backward compatibility with inline blip lookups
 
@@ -47,10 +47,10 @@ def extract_figure(docx_path, figure_num, output_dir='doc/output/images'):
     os.makedirs(output_dir, exist_ok=True)
 
     with zipfile.ZipFile(docx_path) as z:
-        with z.open('word/document.xml') as f:
-            tree = etree.parse(f)
+        img_data = z.read('word/document.xml')
+        tree_root = parse_xml(img_data)
 
-        root = tree.getroot()
+        root = tree_root
         body = root.find(f'{{{W}}}body')
 
         rels_map = parse_rels(z)
@@ -75,8 +75,9 @@ def extract_figure(docx_path, figure_num, output_dir='doc/output/images'):
 
             caption = text
             # Search backwards for the image/object in preceding paragraphs.
-            # Look up to 20 paragraphs for the associated image
-            # (safe upper bound; spec documents keep images and captions close together).
+            # Look up to 20 paragraphs: a safe upper bound for docx files where
+            # captions (FigureTitle style) and their images/blips are adjacent.
+            # 20 covers rare cases with intervening empty or formatting paragraphs.
             prev = p.getprevious()
             for _ in range(20):
                 if prev is None:

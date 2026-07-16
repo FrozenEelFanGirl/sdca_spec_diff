@@ -41,10 +41,10 @@ import zipfile
 from pathlib import Path
 from lxml import etree
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / 'scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ''))
 
-from common import W, NS, DEFINITION_STYLES, build_style_map, parse_toc, para_to_markdown
+from config import ROOT  # noqa: E402
+from common import W, NS, DEFINITION_STYLES, build_style_map, parse_toc, para_to_markdown, parse_xml
 
 
 def _para_runs(p_elem):
@@ -78,6 +78,9 @@ def _split_acronym(runs: list[str]) -> tuple[str, str]:
             break
 
     if not acr_runs and runs:
+        # Fallback: no bold/all-caps run found — assume first run is the
+        # acronym.  This handles cases like "rms" (root mean square) where
+        # the acronym is lowercase and doesn't match _is_acronym_run.
         acr_runs = [runs[0]]
 
     acronym = ''.join(acr_runs).strip()
@@ -91,7 +94,7 @@ def extract_acronyms(docx_path: str) -> dict[str, str]:
         doc_xml = z.read('word/document.xml')
         styles_xml = z.read('word/styles.xml')
 
-    root = etree.fromstring(doc_xml)
+    root = parse_xml(doc_xml)
     body = root.find(f'{{{W}}}body')
 
     num_to_heading, heading_to_num = parse_toc(doc_xml)

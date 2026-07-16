@@ -27,11 +27,22 @@ and comparison scripts.  Import from here instead of duplicating.
 
 import os
 import re
+import sys
+import logging
 from lxml import etree
 
 # ── XML namespaces ──────────────────────────────────────────────────────────
 
 W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+# Secure parser: entity expansion is disabled to prevent billion-laughs
+# and similar XML entity-expansion DoS attacks in untrusted docx input.
+_SECURE_PARSER = etree.XMLParser(resolve_entities=False)
+
+
+def parse_xml(xml_bytes):
+    """Parse XML bytes with entity expansion disabled."""
+    return etree.fromstring(xml_bytes, _SECURE_PARSER)
 WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
 A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
@@ -65,6 +76,20 @@ NOTE_BODY_STYLES = {'NoteBody'}
 DEFINITION_STYLES = {'Definition'}
 FIGURE_TITLE_STYLES = {'FigureTitle'}
 TABLE_TITLE_STYLES = {'TableTitle'}
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+def get_logger(name):
+    """Return a logger writing to stderr with consistent formatting.
+    Repeated calls with the same *name* return the same logger instance."""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        h = logging.StreamHandler(sys.stderr)
+        h.setFormatter(logging.Formatter('%(levelname).4s [%(name)s] %(message)s'))
+        logger.addHandler(h)
+        logger.setLevel(logging.WARNING)
+    return logger
+
 
 # ── Spelling variants ────────────────────────────────────────────────────────
 
@@ -109,7 +134,7 @@ def parse_toc(doc_xml_bytes):
 
     Returns (num_to_heading, heading_to_num).
     """
-    root = etree.fromstring(doc_xml_bytes)
+    root = parse_xml(doc_xml_bytes)
     body = root.find(f'{{{W}}}body')
     if body is None:
         return {}, {}
@@ -145,7 +170,7 @@ def parse_toc(doc_xml_bytes):
 
 def build_style_map(styles_xml):
     """Parse styles.xml and resolve outline levels through inheritance."""
-    root = etree.fromstring(styles_xml)
+    root = parse_xml(styles_xml)
     style_info = {}
     for style in root.iter(f'{{{W}}}style'):
         sid = style.get(f'{{{W}}}styleId')
@@ -216,9 +241,11 @@ def para_to_markdown(p_elem):
 
 
 def table_to_markdown(tbl_elem):
-    """Convert a w:tbl element to a Markdown table."""
+    """Convert a w:tbl element to a Markdown table.
+    Warns via logging when the table element has no data rows."""
     rows = tbl_elem.findall(f'{{{W}}}tr')
     if not rows:
+        get_logger('common').warning('Empty table element found (zero w:tr rows)')
         return ''
 
     lines = []
@@ -244,7 +271,7 @@ def table_to_markdown(tbl_elem):
 def parse_rels(zip_file):
     """Parse document.xml.rels to map rId -> target path."""
     rels_xml = zip_file.read('word/_rels/document.xml.rels')
-    root = etree.fromstring(rels_xml)
+    root = parse_xml(rels_xml)
     rels = {}
     for rel in root:
         rid = rel.get('Id')
@@ -625,11 +652,20 @@ def render_output_to_markdown(output):
         lines.append('```')
         lines.append('')
 
-    # Collapse runs of blank lines
+    # Collapse runs of blank lines, except inside fenced code blocks
+    # where blank lines are meaningful content.
     result = []
     blank_count = 0
+    in_fence = False
     for line in lines:
-        if line == '':
+        if line.startswith('```'):
+            in_fence = not in_fence
+            blank_count = 0
+            result.append(line)
+        elif in_fence:
+            blank_count = 0
+            result.append(line)
+        elif line == '':
             blank_count += 1
             if blank_count <= 2:
                 result.append(line)

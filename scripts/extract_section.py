@@ -48,7 +48,7 @@ from common import (
     TOC_STYLES,
     build_style_map, parse_toc, parse_rels,
     para_to_markdown, section_file, resolve_refs, render_output_to_markdown,
-    sort_key,
+    sort_key, parse_xml,
     process_content_paragraph, process_content_table,
 )
 
@@ -68,7 +68,7 @@ def extract_section(docx_path, section_id, output_dir='doc/output', index_path=N
     styles_xml = z.read('word/styles.xml')
     style_map = build_style_map(styles_xml)
     doc_xml = z.read('word/document.xml')
-    root = etree.fromstring(doc_xml)
+    root = parse_xml(doc_xml)
     body = root.find(f'{{{W}}}body')
 
     rels_map = parse_rels(z)
@@ -217,7 +217,7 @@ def extract_sections(docx_path, output_dir, index_path=None):
     styles_xml = z.read('word/styles.xml')
     style_map = build_style_map(styles_xml)
     doc_xml = z.read('word/document.xml')
-    root = etree.fromstring(doc_xml)
+    root = parse_xml(doc_xml)
     body = root.find(f'{{{W}}}body')
 
     rels_map = parse_rels(z)

@@ -39,12 +39,13 @@ import json
 from difflib import SequenceMatcher
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ''))
 
-from config import load_config
-from common import SPELLING_VARIANTS
+from config import load_config, ROOT
+from common import SPELLING_VARIANTS, get_logger
 from diff_images import diff_images
+
+log = get_logger('compare_sections')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -295,6 +296,11 @@ def _merge_split_numbered_lists(blocks: list[str]) -> list[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _normalize_block(block: str, apply_spelling: bool = True) -> str:
+    # Normalize to lowercase, strip markdown syntax, then remove all
+    # punctuation.  Removing punctuation reduces structural noise for
+    # matching but can lose semantically meaningful differences
+    # (e.g. "IEEE 802.11" becomes indistinguishable from "IEEE 80211"
+    # in the rare case both appear in the same document).
     t = block.lower()
     t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
     t = re.sub(r'\*\*([^*]+)\*\*', r'\1', t)
@@ -653,6 +659,8 @@ def _diff_table(base_block: str, comp_block: str) -> tuple[list[str], list[str]]
 
 def _compare_images(base_block: str, comp_block: str,
                     base_dir: Path, comp_dir: Path) -> str | None:
+    """Pixel-diff two figure images.  Result is memoized — callers may
+    invoke this multiple times for the same pair and only pay the cost once."""
     m1 = re.search(r'!\[Figure\s+(\d+)', base_block)
     m2 = re.search(r'!\[Figure\s+(\d+)', comp_block)
     if not m1 or not m2: return None
@@ -662,6 +670,33 @@ def _compare_images(base_block: str, comp_block: str,
     ratio, _, _, _ = diff_images(str(p1), str(p2))
     return '*Changed (' + str(int(ratio)) + '% diff)*' if ratio >= 2.0 else '*Unchanged.*'
 
+
+# Per-invocation image-diff cache so _compare_images is never called
+# twice for the same (base_block, comp_block) pair within one section.
+_img_diff_cache: dict[tuple[str, str], str | None] = {}
+
+
+def _cached_compare_images(base_block: str, comp_block: str,
+                           base_dir: Path, comp_dir: Path) -> str | None:
+    key = (base_block, comp_block)
+    if key not in _img_diff_cache:
+        _img_diff_cache[key] = _compare_images(base_block, comp_block, base_dir, comp_dir)
+    return _img_diff_cache[key]
+
+
+# TODO: Extract _fuzzy_lookahead resynchronization logic (Manhattan distance
+# search, lines ~960-980) into its own function so the four-tier fallback
+# strategy (same-cat lookahead / reverse lookahead / Manhattan resync /
+# salvage) is readable as a dispatch table rather than inline control flow.
+#
+# TODO: Extract the _emit closure into a small state-holder class (e.g.
+# BlockEmitter) with .out, .label, and methods for each tag.  This would
+# make the diff logic unit-testable independently of the output format.
+#
+# TODO: After the main matching loop, add a two-pass "salvage" phase:
+# re-run similarity matching on remaining unmatched blocks before falling
+# through to the all-NEW/all-DELETED emit.  Currently a single failed
+# Manhattan resync emits every remaining block as NEW or DELETED.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Logging
@@ -725,10 +760,12 @@ def _heading_sibling_counts(blocks: list[str]) -> list[int]:
             if hidxs[j][1] < level:
                 start = hidxs[j][0]
                 break
-        # Find end: next heading with same or higher level after this sibling group
+        # Find end: first heading with strictly higher level after all
+        # siblings.  Using < (not <=) ensures the entire sibling group
+        # is consumed, not just the first sibling.
         end = len(blocks)
         for j in range(pos, len(hidxs)):
-            if hidxs[j][1] <= level and hidxs[j][0] > idx:
+            if hidxs[j][1] < level and hidxs[j][0] > idx:
                 end = hidxs[j][0]
                 break
         # Count same-level siblings in (start, end)
@@ -777,6 +814,9 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
     paired 1-to-1.  Lists and tables stay as whole blocks — _diff_list
     and _diff_table handle per-item / per-row comparison internally."""
 
+    global _img_diff_cache
+    _img_diff_cache = {}
+
     if not comp_blocks:
         return '\n\n'.join(base_blocks) + '\n'
 
@@ -817,7 +857,7 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
                 verdict = (v_label.replace('Unchanged (besides ', '')
                           .replace(')', '') if v_label else 'diff')
             if (cat == 'figure' and base_img_dir and comp_img_dir):
-                pix = _compare_images(b, c, base_img_dir, comp_img_dir)
+                pix = _cached_compare_images(b, c, base_img_dir, comp_img_dir)
                 if pix and pix != '*Unchanged.*':
                     verdict = 'diff'
         _label = v_label
@@ -835,7 +875,7 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
             if cat == 'heading':
                 out.append('')
             elif cat == 'figure' and base_img_dir and comp_img_dir and c:
-                ann = _compare_images(b, c, base_img_dir, comp_img_dir)
+                ann = _cached_compare_images(b, c, base_img_dir, comp_img_dir)
                 _emit_comp(out, [ann or '*Unchanged.*'], comp_version)
             elif cat == 'list':
                 out.append('')
@@ -862,7 +902,7 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
             elif cat == 'figure':
                 out.append(b); out.append('')
                 if base_img_dir and comp_img_dir:
-                    pix = _compare_images(b, c, base_img_dir, comp_img_dir)
+                    pix = _cached_compare_images(b, c, base_img_dir, comp_img_dir)
                     if pix and pix != '*Unchanged.*':
                         _emit_comp(out, [c, pix], comp_version)
                     elif _label:
@@ -1172,15 +1212,15 @@ def build_comparison(base_content: str, comp_num: str | None,
 def main():
     cfg = load_config()
     if not cfg.mapping_file.exists():
-        print(f'ERROR: Mapping file not found: {cfg.mapping_file}')
-        print('Run extract_all.py first to generate the mapping.')
+        log.error('Mapping file not found: %s', cfg.mapping_file)
+        log.error('Run extract_all.py first to generate the mapping.')
         sys.exit(1)
     with open(cfg.mapping_file, encoding='utf-8') as f:
         mapping = json.load(f)
 
     if len(sys.argv) >= 2:
         rp = Path(sys.argv[1])
-        if not rp.is_absolute(): rp = ROOT / rp
+        if not rp.is_absolute(): rp = Path(ROOT) / rp
         section_nums = parse_report(rp)
         print(f'Parsed {len(section_nums)} checked sections from {rp.name}')
     else:
@@ -1199,7 +1239,7 @@ def main():
     for num in section_nums:
         bc = read_section_file(cfg.base.sections_dir, num)
         if bc is None:
-            print(f'  SKIP §{num}: not found in base sections'); continue
+            log.warning('SKIP §%s: not found in base sections', num); continue
 
         m = find_counterpart(num, mapping)
         cn = m['comp_num'] if m else None
@@ -1218,7 +1258,7 @@ def main():
                   len(_split_blocks(bc)),
                   len(_split_blocks(cc)) if cc else 0)
 
-        cv = cfg.comparison.version.replace('p', '.')
+        cv = cfg.comparison.version_display
         text = build_comparison(bc, cn, ch, cc, kd, cv,
                                 base_img_dir=cfg.base.images_dir,
                                 comp_img_dir=cfg.comparison.images_dir,
@@ -1233,7 +1273,7 @@ def main():
         created += 1
         log.end()
 
-    print(f'Created {created} comparison files in {out_dir.relative_to(ROOT)}')
+    print(f'Created {created} comparison files in {out_dir.relative_to(Path(ROOT))}')
 
 
 if __name__ == '__main__':

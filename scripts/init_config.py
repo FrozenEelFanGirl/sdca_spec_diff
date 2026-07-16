@@ -47,12 +47,15 @@ CONFIG_PATH = Path(__file__).resolve().parent / 'config.json'
 W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 NS = {'w': W}
 
+# Secure XML parser (entity expansion disabled)
+_SECURE_PARSER = etree.XMLParser(resolve_entities=False)
+
 
 # ── Metadata extraction ────────────────────────────────────────────────────
 
 def _read_core_xml(z: zipfile.ZipFile) -> dict:
     """Extract core.xml metadata fields."""
-    core = etree.fromstring(z.read('docProps/core.xml'))
+    core = etree.fromstring(z.read('docProps/core.xml'), _SECURE_PARSER)
     meta = {}
     for child in core:
         tag = child.tag.split('}')[-1]
@@ -63,7 +66,7 @@ def _read_core_xml(z: zipfile.ZipFile) -> dict:
 
 def _read_first_page_paragraphs(z: zipfile.ZipFile, limit: int = 40) -> list[str]:
     """Return first non-empty paragraphs from the document (scan all elements for cover page)."""
-    doc = etree.fromstring(z.read('word/document.xml'))
+    doc = etree.fromstring(z.read('word/document.xml'), _SECURE_PARSER)
     paras = []
     for p in doc.iter(f'{{{W}}}p'):
         text = ''.join(t.text or '' for t in p.iter(f'{{{W}}}t')).strip()
@@ -203,10 +206,10 @@ def generate_config(infos: list[DocInfo], clear: bool = False,
         remaining.sort(key=lambda i: _version_sort_key(i.version_cover), reverse=True)
         base_info = remaining[0]
     else:
-        # Auto-detect: newest is base, second-newest is comparison
+        # Auto-detect: newest is base, oldest is comparison
         valid.sort(key=lambda i: _version_sort_key(i.version_cover), reverse=True)
         base_info = valid[0]
-        comp_info = valid[1]
+        comp_info = valid[-1]
 
     base_ver = base_info.version_cover
     comp_ver = comp_info.version_cover

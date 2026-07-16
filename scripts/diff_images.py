@@ -36,7 +36,7 @@ from PIL import Image
 VERDICT_THRESHOLD = 2.0
 
 
-def diff_images(path1, path2, threshold=30):
+def diff_images(path1: str, path2: str, threshold: int = 30) -> tuple[float, float, Image.Image, np.ndarray]:
     """Compare two images pixel-by-pixel. Returns (diff_ratio, mean_distance, base_img, diff_array)."""
     img1 = Image.open(path1).convert('RGB')
     img2 = Image.open(path2).convert('RGB')
@@ -63,7 +63,7 @@ def diff_images(path1, path2, threshold=30):
     return ratio, mean_dist, img1_r, diff
 
 
-def generate_diff_overlay(base_img, diff, threshold, output_path):
+def generate_diff_overlay(base_img: Image.Image, diff: np.ndarray, threshold: int, output_path: str) -> None:
     """Generate a diff overlay: red pixels where images differ."""
     base_arr = np.array(base_img)
     mask = diff > threshold

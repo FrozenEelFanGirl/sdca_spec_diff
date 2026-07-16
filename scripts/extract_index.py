@@ -37,7 +37,7 @@ from lxml import etree
 
 from common import (
     W, NS, TOC_STYLES, FIGURE_TITLE_STYLES, TABLE_TITLE_STYLES,
-    parse_toc, build_style_map, para_to_markdown,
+    parse_toc, build_style_map, para_to_markdown, parse_xml,
 )
 
 
@@ -47,7 +47,7 @@ def build_index(docx_path):
         doc_xml = z.read('word/document.xml')
         styles_xml = z.read('word/styles.xml')
 
-    root = etree.fromstring(doc_xml)
+    root = parse_xml(doc_xml)
     body = root.find(f'{{{W}}}body')
 
     num_to_heading, heading_to_num = parse_toc(doc_xml)

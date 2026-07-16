@@ -37,7 +37,7 @@ import re
 import zipfile
 from lxml import etree
 
-from common import W, para_to_markdown, table_to_markdown
+from common import W, para_to_markdown, table_to_markdown, parse_xml
 
 
 def extract_table(docx_path, table_num, output_dir='doc/output/tables'):
@@ -45,10 +45,10 @@ def extract_table(docx_path, table_num, output_dir='doc/output/tables'):
     os.makedirs(output_dir, exist_ok=True)
 
     with zipfile.ZipFile(docx_path) as z:
-        with z.open('word/document.xml') as f:
-            tree = etree.parse(f)
+        img_data = z.read('word/document.xml')
+        tree_root = parse_xml(img_data)
 
-        root = tree.getroot()
+        root = tree_root
         body = root.find(f'{{{W}}}body')
 
         for p in body:
@@ -71,8 +71,9 @@ def extract_table(docx_path, table_num, output_dir='doc/output/tables'):
 
             caption = text
             # Search forward for the next <w:tbl> element.
-            # Look up to 20 paragraphs for the associated table
-            # (safe upper bound; spec documents keep captions and tables close together).
+            # Look up to 20 paragraphs: a safe upper bound for docx files where
+            # captions (TableTitle style) and tables are adjacent.  20 covers
+            # rare cases with intervening empty or formatting paragraphs.
             next_sib = p.getnext()
             for _ in range(20):
                 if next_sib is None:
