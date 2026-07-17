@@ -26,7 +26,7 @@ Compare two versions of the MIPI SDCA specification and produce annotated interl
 
 ## Prerequisites
 
-Python 3.14 and the packages listed in `requirements.txt`.
+Python 3.10 or newer (developed on 3.14) and the packages listed in `requirements.txt`.
 
 ## Setup
 
@@ -75,11 +75,20 @@ python -X utf8 scripts/extract_all.py          # clears old output by default
 python -X utf8 scripts/extract_all.py --no-clean  # keep existing output
 ```
 
-This runs the full pipeline: builds master indexes → extracts all sections/tables/figures → applies text fixups → parses acronyms from section 2.4 → maps sections between versions → fingerprints content similarity. All output goes under `doc/output_<base>/`, `doc/output_<comp>/`, and `doc/comparison_<base>_<comp>/`.
+This runs the full pipeline: builds master indexes → extracts all sections/tables/figures (verified file-by-file against the index) → applies text fixups → parses acronyms from section 2.4. All output goes under `doc/output_<base>/`, `doc/output_<comp>/`, and `doc/comparison_<base>_<comp>/`.
 
 ### Stage 2 — Compare a Topic (repeat for each area of interest)
 
-**1. Search for sections:**
+**1. Build the section mapping (once per version pair):**
+
+```bash
+python -X utf8 scripts/map_sections.py
+python -X utf8 scripts/map_fixups.py
+```
+
+`map_sections.py` builds the section and deep-heading mappings that anchor all comparisons; `map_fixups.py` applies manual corrections from its built-in fixup table. Re-run `map_fixups.py` after every mapping rebuild.
+
+**2. Search for sections:**
 
 ```bash
 # Word-level AND matching (acronym expansion, prefix support):
@@ -90,21 +99,23 @@ python -X utf8 scripts/search_sections.py --phrase "DisCo Addressing"
 python -X utf8 scripts/search_sections.py --section 5.1
 ```
 
-Produces a checklist of **all** 592 sections, with matching ones pre-checked (`✓`). Reports are saved to `doc/comparison_<base>_<comp>/index/<keyword>.md` (or `section_<num>.md` for `--section`).
+Produces a checklist of **all** sections in the base document, with matching ones pre-checked (`✓`). Reports are saved to `doc/comparison_<base>_<comp>/index/<keyword>.md` (or `section_<num>.md` for `--section`).
 
-**2. Select sections to compare:**
+**3. Select sections to compare:**
 
 Edit the generated report — remove `✓` from unwanted rows, or add `✓` to additional sections.
 
-**3. Generate comparison files:**
+**4. Generate comparison files:**
 
 ```bash
 python -X utf8 scripts/compare_sections.py doc/comparison_<base>_<comp>/index/<keyword>.md
 ```
 
-This creates interleaved comparison files for each checked section. Paragraphs are aligned by content similarity: each base paragraph is immediately followed by its comparison counterpart in blockquotes (prefixed with `> **vX.Y:**`). Body paragraphs get word-level inline diffs — **bold** for new/changed text, ~~strikethrough~~ for removed text. Lists, tables, and code blocks are shown as-is.
+(Omit the report argument to compare all sections from the mapping.)
 
-**4. Annotate changes:**
+This creates interleaved comparison files for each checked section, anchored to the section and deep-heading mappings: every base section, subsection, and deep heading is paired with its mapped counterpart wherever it lives in the comparison document. Within each pair, blocks are aligned by content similarity: each base block is immediately followed by its comparison counterpart in blockquotes (prefixed with `> **vX.Y:**`). Body paragraphs get word-level inline diffs — **bold** for new/changed text, ~~strikethrough~~ for removed text. Lists get per-item diffs, tables per-cell diffs, and figures are pixel-diffed.
+
+**5. Annotate changes:**
 
 Edit each `_comparison.md` file to mark what changed — bold for new/changed text, strikethrough for removed text.
 
@@ -123,7 +134,7 @@ doc/
     index/index.json          # tracked in git
     ...
   comparison_<base>_<comp>/   # diff output
-    index/                    # full_mapping.json + search reports + fingerprints
+    index/                    # full/deep mappings + fixup report + search reports
     sections/                 # interleaved comparison files
     images/                   # version-suffixed figure copies
     tables/                   # version-suffixed table copies
@@ -138,7 +149,8 @@ scripts/
   extract_fixups.py           # text corrections (basic + version-specific)
   extract_figure.py           # extract single figure
   extract_table.py            # extract single table
-  map_sections.py             # map + fingerprint sections across versions
+  map_sections.py             # section + deep-heading mapping across versions
+  map_fixups.py               # manual mapping corrections (fixup table)
   search_sections.py          # full-text keyword search (with acronym expansion)
   compare_sections.py         # generate interleaved comparison files (word-level diff)
   diff_images.py              # pixel-diff two figures
@@ -153,4 +165,4 @@ tests/
 - All scripts use the configuration generated by `init_config.py`. Running any script before `init_config.py` will produce an error telling you to run it first.
 - The `doc/` directory contents are git-ignored since they include large source documents and generated output.
 - `extract_all.py` clears old output by default. Use `--no-clean` to keep existing extractions.
-- Run tests with: `python -X utf8 -m unittest tests.test_section_5_1_golden -v`
+- Run tests with: `python -X utf8 -m unittest tests.test_section_5_1_golden -v` — requires a completed section 5.1 workflow first (the test only byte-compares the generated file against the golden; Windows-only).
