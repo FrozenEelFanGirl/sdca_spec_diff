@@ -28,6 +28,8 @@ python -X utf8 scripts/extract_all.py              # clears old output by defaul
 # python -X utf8 scripts/extract_all.py --no-clean  # keep existing output
 
 # Stage 2 — per-topic comparison
+python -X utf8 scripts/map_sections.py             # build section mapping (once per version pair)
+python -X utf8 scripts/map_fixups.py               # apply manual mapping corrections
 python -X utf8 scripts/search_sections.py "<keyword>"
 # edit report: remove ✓ from unwanted sections
 python -X utf8 scripts/compare_sections.py doc/comparison_<base>_<comp>/index/<keyword>.md
@@ -40,9 +42,24 @@ python -X utf8 scripts/compare_sections.py doc/comparison_<base>_<comp>/index/<k
 python -X utf8 -m unittest tests.test_section_5_1_golden -v
 ```
 
-The integration test regenerates the comparison for section 5.1 and asserts
-byte-for-byte equality with the manually reviewed golden file at
-`tests/5.1_Overview_of_SDCA_Functions_comparison_golden.md`.
+The test runs nothing itself — completing the section 5.1 workflow is a
+prerequisite (`extract_all.py` → `map_sections.py` → `map_fixups.py` →
+`search_sections.py --section 5.1` →
+`compare_sections.py .../index/section_5_1.md`). The test then asserts the
+generated `doc/comparison_*/sections/5.1_..._comparison.md` is byte-for-byte
+identical to the manually reviewed golden file at
+`tests/5.1_Overview_of_SDCA_Functions_comparison_golden.md`. If the
+comparison file is missing, the test fails with the workflow commands to run.
+
+**Limitations:**
+
+- **Windows-only.** The byte comparison includes line endings: the workflow
+  writes OS-native line endings (CRLF on Windows) and the golden file is
+  stored with CRLF, so the check fails on macOS/Linux (LF). Releases are
+  tested on Windows only.
+- The test validates whatever the last workflow run left on disk — a stale
+  comparison file passes even if the scripts have changed since. Re-run the
+  workflow before testing a code change.
 
 ## Configuration
 
@@ -81,11 +98,14 @@ Version is parsed from the cover page ("Version X.Y" + optional "Revision Z" →
 Orchestrates the full extraction pipeline:
 
 1. `extract_index` for base and comparison versions
-2. Full section extraction (sections, tables, images) for both versions
+2. Full section extraction (sections, tables, images) for both versions,
+   verified against the index: section file count must equal index section
+   count and every filename must match the index-recorded `file` field,
+   otherwise the pipeline reports missing/extra/mismatched names and exits 1
 3. `extract_fixups` — apply text corrections (basic typos + version-specific)
 4. `extract_acronyms` — parse section 2.4, generate `acronyms.json`
-5. `map_sections --mode heading` — full section mapping (`full_mapping.json`)
-6. `map_sections --mode content` — content fingerprints for all matched pairs (`content_fingerprints.json`)
+
+Section mapping is a Stage 2 step (`map_sections.py`).
 
 Clears old output directories by default.  Pass `--no-clean` to keep existing extractions.
 
@@ -140,29 +160,108 @@ python -X utf8 scripts/extract_section.py <docx_path> <section_id> --output-dir 
 
 `<section_id>` can be a section number (`"5.1.2"`) or heading keyword (`"Smart Amp"`).
 
+## Stage 2: Comparison
+
 ### map_sections.py
 
-Two modes for mapping sections between base and comparison versions:
+Builds the combined section mapping — the anchor for all comparisons. Run once
+per version pair, after `extract_all.py` (it reads the extracted section text).
 
-**Heading mode** (`--mode heading`): compares index headings, outputs mapping table with similarity scores:
+Five passes; matching is one-to-one (every match consumes the comparison section):
+
+1. **Same-number exact**: base §N vs comp §N, headings exactly equal
+   (normalized: lowercase, punctuation stripped, whitespace collapsed) → `same`
+2. **Cross-number exact**: equal heading under a different number → `same`.
+   Multiple equal candidates: content score decides *which* (no gate)
+3. **Same-number fuzzy**: base §N and comp §N both still unmatched with
+   heading similarity ≥ 0.75 → `same` (no content gate — systematic
+   terminology renames lower content similarity exactly when the heading
+   is fuzzy, e.g. NDAI_* → External_*)
+4. **Fuzzy**: heading similarity ≥ 0.75 gates candidacy; candidates scored
+   `combined = 0.2 × whole-text trigram sim + 0.8 × opening-paragraphs trigram sim`.
+   Best candidate over 0.6 → `same`, otherwise → `new`
+5. **Inspection**: comparison sections never matched → `deleted`;
+   a `new` base section with any matched descendant → `restructure`
 
 ```
-python -X utf8 scripts/map_sections.py --mode heading --filter UAJ
-python -X utf8 scripts/map_sections.py --mode heading --output mapping.json
+python -X utf8 scripts/map_sections.py                       # build mapping
+python -X utf8 scripts/map_sections.py --id 5.11.3           # single-pair fingerprint report
+python -X utf8 scripts/map_sections.py --id 5.11.3 --comp-id 5.5.1
 ```
 
-**Content mode** (`--mode content`): compares extracted section body text, outputs structural fingerprint delta:
+Outputs to `<comparison_dir>/index/`:
 
-```
-python -X utf8 scripts/map_sections.py --mode content --id 5.11.3
-python -X utf8 scripts/map_sections.py --mode content --id 5.11.3 --comp-id 5.5.1
-```
+- `full_mapping.json` — machine-readable, consumed by `compare_sections.py`
+- `full_mapping.md` — review table:
+  `base_num | base_heading | comp_num | comp_heading | head_sim | trigram_sim | opening_sim | combined_sim | kind`
 
-Mapping verdicts: `exact_match` (≥0.95), `fuzzy_match` (≥0.75), `new_section` (<0.75), `deleted_in_base`.
+Kinds: `same`, `new`, `restructure`, `deleted`. Similarity columns are empty
+for rows that never reached the content scoring (Pass 1/2 single matches,
+`new`, `deleted`). Rows follow base document order; each `deleted` row is
+threaded in comparison-document order — anchored right after the row that
+matched its nearest matched predecessor comp section.
+
+**Deep mapping** (`deep_mapping.json` / `deep_mapping.md`): maps `####`
+and `#####` headings as first-class mapping nodes (`######` never anchors —
+if it appears it is original paragraph text). Built after the section
+mapping: forced pairs from `map_fixups.py` are pre-seeded, then five
+matching passes run in a stabilization loop — every match can create a new
+container pair that unlocks further scoped matches, so the loop restarts
+from the highest-priority pass after each match:
+  1. scoped exact heading — comp candidate lives under the matched
+     counterpart of the base node's container; ungated, content picks
+     among multiple candidates
+  2. scoped fuzzy — head_sim ≥ 0.75, combined > 0.6
+  3. scoped content-alone — combined ≥ 0.75 decides by itself (renamed
+     headings with near-identical content)
+  4. cross-granularity global — at least one side is a section; exact or
+     fuzzy heading, combined ≥ 0.6 (deep↔deep never matches globally, or
+     scaffolds under consumed comp sections leak)
+  5. elimination — exactly one unmatched child on each side under a
+     matched container pair, gated at combined ≥ 0.40
+Leftovers: base → `new` (→ `restructure` if matched descendants), comp →
+`deleted`.
+Cross-granularity rows allow base section ↔ comp pseudo-node and vice versa
+(e.g. base 5.3.5 ↔ comp 5.2.3#Transducer Power Domains…). Node IDs are
+hierarchical paths: `5.2.2#Reference Signal Path#Rules`; path collisions
+get ` [n]` ordinals. `map_fixups.py` entries containing `#` in their ids
+route to the deep mapping (rebuilds it from the fixed section mapping).
 
 JSON field names use `base_`/`comp_` prefixes: `base_num`, `comp_num`, `base_heading`, etc.
 
-## Stage 2: Comparison
+### map_fixups.py
+
+Applies manual corrections to the mapping — for pairs the algorithm gets
+wrong (e.g. a rewritten introduction defeats the 0.6 content gate).
+Mirrors `extract_fixups.py`: a hand-editable `MAPPING_FIXUPS` table at the
+top of the script, keyed by `(base_version, comp_version)`, applied only
+when the configured version pair matches.
+
+```
+python -X utf8 scripts/map_fixups.py
+```
+
+Each entry forces `base_num ↔ comp_num` to `same`:
+
+```python
+{'base_num': '5.7.3', 'comp_num': '5.3.9', 'reason': '...'}
+```
+
+Semantics:
+
+- The forced row gets real computed similarities and a `"fixup": true`
+  marker in the JSON; `kind` becomes `same`.
+- Pairs displaced by a fixup are broken: the displaced comparison section
+  becomes `deleted`, the displaced base section becomes `new`.
+- `restructure` and deleted-row threading are recomputed, so all mapping
+  invariants (one-to-one, ordering) still hold.
+- Rewrites `full_mapping.json` + `full_mapping.md`; writes a report to
+  `<comparison_dir>/index/map_fixups.md`. Idempotent.
+- Validation is hard: unknown section numbers or duplicate base/comp
+  entries abort with exit 1.
+
+**`map_sections.py` regenerates the mapping from scratch — re-run
+`map_fixups.py` after every mapping rebuild.**
 
 ### search_sections.py
 
@@ -208,9 +307,36 @@ Reads a search report and generates interleaved comparison files.
 python -X utf8 scripts/compare_sections.py <report.md>
 ```
 
-If `<report.md>` is omitted, compares ALL sections from the mapping.
+If `<report.md>` is omitted, compares ALL sections from the mapping
+(`deleted` comp-only sections are never compared — the mapping table is
+their only record).
 
-For each checked section, blocks follow this pipeline:
+**Section-anchored units.** Each checked section's subtree is split at
+subsection boundaries and driven by `full_mapping.json` (the anchor):
+
+- `same` subsection → a **pair unit**: base intro (own content up to its
+  first child heading) vs the comp counterpart's intro, read from the comp
+  section file by `comp_num` — wherever it lives (same-numbered, renumbered,
+  or moved). Unit headings are known counterparts, so they are paired
+  directly (never matched heuristically). Renumbered/moved units get
+  `> **Mapped from comparison §X.Y**` right under the base heading;
+  same-numbered in-order units get no extra annotation.
+- `new` subsection → whole subtree rendered verbatim under
+  `> **New in this version**`, no block matching.
+- `restructure` subsection → intro rendered under
+  `> **New in this version (restructured — subsections mapped individually)**`,
+  then its children walked normally.
+
+Units are walked in base document order; only content *within* a pair unit
+goes through block matching. Deep headings (`####`+) are not numbered
+sections but are mapped via `deep_mapping.json` — each becomes its own
+unit, anchored to its comparison counterpart. Deep-new units render
+per-block bold (historical shape); truly-deleted deep topics produce no
+output (mapping is the record). P4: list⇄paragraph cross-category pairing
+is enabled by default (`MATCH_LIST_PARAGRAPH = True`), producing
+`*Reformatted (paragraph ⇄ list)*`; `--strict-categories` to disable.
+
+Within each pair unit, blocks follow this pipeline:
 
 1. **Strip blockquotes** — `_strip_blockquotes`: join consecutive `>` lines into single
    paragraphs so notes don't get split across blocks.
@@ -239,8 +365,10 @@ For each checked section, blocks follow this pipeline:
    threshold, search ahead for a matching block of the same category.
 5. **Resynchronization** (Manhattan distance, window=15): find the closest (dx,dy) where
    blocks match by category and similarity. Batch-emit unmatched blocks as NEW/DELETED
-   to avoid ping-pong shredding of multi-block insertions. Falls through to emitting all
-   remaining blocks as NEW/DELETED if no resync point is found.
+   to avoid ping-pong shredding of multi-block insertions.
+6. **Salvage** (`_salvage_remaining`): if resync fails, score all remaining same-category
+   pairs, keep the best matches greedily under a monotone-order constraint, and emit
+   pairs/new/deleted in base order — instead of dumping everything as NEW/DELETED.
 
 **Block-type-specific thresholds** (trigram overlap, 0–1):
 
@@ -278,7 +406,10 @@ Specialized handlers:
 - **Headings**: shown as-is, no inline annotation.
 
 Logging: per-section log written synchronously to `comparison_*/sections/<num>_<heading>_comparison.log`.
-Annotation header shows mapping info (`Mapped from comparison §X.Y`, `New in this version`, etc.)
+Unit boundaries appear as `-- §5.4.4 <-> §5.2.6 [same, moved] --` separator lines
+(labels: `[same]`, `[same, moved]`, `[new]`, `[restructure]`); emit numbering is
+continuous across units. Annotation header shows mapping info
+(`Mapped from comparison §X.Y`, `New in this version`, etc.)
 
 Generated file format (interleaved — comparison blocks follow their base counterparts):
 
@@ -360,7 +491,8 @@ doc/
     sections/                           # <num>_<heading>_comparison.md
     tables/                             # copied from output dirs with version suffix (Table1_v1p0.md)
     images/                             # copied from output dirs with version suffix (Figure1_v1p0.png)
-    index/                              # full_mapping.json + content_fingerprints.json + search reports
+    index/                              # full_mapping.json/.md + deep_mapping.json/.md
+                                        #   + map_fixups.md + search reports
 scripts/
   common.py                             # Shared OOXML utilities, markdown rendering, logging, secure XML parser
   config.py                             # Typed config loader, ROOT export, key validation
@@ -373,10 +505,11 @@ scripts/
   extract_fixups.py                     # Text corrections (basic typos + version-specific)
   extract_figure.py                     # Extract single figure
   extract_table.py                      # Extract single table
-  map_sections.py                       # Map + fingerprint sections
+  map_sections.py                       # Stage 2.1: section + deep mapping (one-to-one)
+  map_fixups.py                         # Stage 2.2: manual mapping corrections (fixup table)
   diff_images.py                        # Pixel-diff two figures
-  search_sections.py                    # Stage 2.1: full-text keyword search
-  compare_sections.py                   # Stage 2.2: generate comparison files
+  search_sections.py                    # Stage 2.3: full-text keyword search
+  compare_sections.py                   # Stage 2.4: generate comparison files
 tests/
   test_section_5_1_golden.py            # Integration test against golden comparison
   5.1_Overview_of_SDCA_Functions_comparison_golden.md  # Manually reviewed reference output
@@ -384,7 +517,7 @@ tests/
 
 ## Dependencies
 
-- Python 3.14 with `lxml` (`pip install python-docx`)
+- Python 3.10+ with `lxml` (`pip install -r requirements.txt`)
 - PIL/Pillow for EMF to PNG conversion
 - numpy for pixel-diff computation
 - No python-docx API used directly — raw lxml for OOXML access
@@ -401,6 +534,6 @@ tests/
 - **Sibling-match**: `_heading_sibling_counts` (compare_sections.py) correctly counts all
   same-level siblings under a parent, so the sibling-match strategy fires for multi-child
   sections, not just only-children.
-- **Compare_sections.py TODOs**: Three deferred refactors marked with `TODO` comments —
-  extract `_fuzzy_lookahead` resync logic, extract `_emit` closure into a state-holder
-  class, and add a two-pass salvage phase after the main matching loop.
+- **Compare_sections.py TODOs**: One deferred refactor — extract the `_emit`
+  closure into a state-holder class (BlockEmitter). Salvage phase and deep
+  anchoring are implemented.

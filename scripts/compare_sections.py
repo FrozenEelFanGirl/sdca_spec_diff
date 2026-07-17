@@ -24,6 +24,11 @@ Generate interleaved comparison files from a search report.
 Usage:
   python -X utf8 scripts/compare_sections.py <report.md>
 
+Sections are compared unit-by-unit: the full_mapping.json anchors each base
+subsection to its comparison counterpart (same-numbered, renumbered, or
+moved), and only the content within a paired unit goes through block
+matching.  Base-only units are rendered whole as new/restructured.
+
 Diff rules:
   - equal:             base as-is,  comp *Unchanged.*
   - index/spelling:    base as-is,  comp *Unchanged (besides ...)*
@@ -36,16 +41,21 @@ import sys
 import os
 import re
 import json
+import itertools
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ''))
 
 from config import load_config, ROOT
-from common import SPELLING_VARIANTS, get_logger
+from common import (SPELLING_VARIANTS, get_logger, direct_children, own_scope,
+                    collect_deep_headings, slice_heading_scope, DEEP_ANCHOR_RE)
 from diff_images import diff_images
 
 log = get_logger('compare_sections')
+
+MATCH_LIST_PARAGRAPH = True  # allow list↔paragraph cross-category pairing
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -692,11 +702,6 @@ def _cached_compare_images(base_block: str, comp_block: str,
 # TODO: Extract the _emit closure into a small state-holder class (e.g.
 # BlockEmitter) with .out, .label, and methods for each tag.  This would
 # make the diff logic unit-testable independently of the output format.
-#
-# TODO: After the main matching loop, add a two-pass "salvage" phase:
-# re-run similarity matching on remaining unmatched blocks before falling
-# through to the all-NEW/all-DELETED emit.  Currently a single failed
-# Manhattan resync emits every remaining block as NEW or DELETED.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Logging
@@ -726,6 +731,11 @@ class ComparisonLogger:
         if comp_preview:
             self._w(f'      {"comp":<15} | {"":<11} | {_short(comp_preview)}')
         self._idx += 1
+
+    def unit(self, label: str) -> None:
+        """Write a unit-boundary separator (consumes no emit index)."""
+        self._w('')
+        self._w(f'-- {label} --')
 
     def end(self) -> None:
         if self._fp:
@@ -809,16 +819,28 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
                     comp_version: str,
                     base_img_dir: Path | None,
                     comp_img_dir: Path | None,
-                    log: ComparisonLogger | None) -> str:
+                    log: ComparisonLogger | None,
+                    force_head_pair: bool = False,
+                    head_annotation: str | None = None,
+                    all_new: bool = False) -> list[str]:
     """Count-first matching (paragraphs, figures): equal-length runs are
     paired 1-to-1.  Lists and tables stay as whole blocks — _diff_list
-    and _diff_table handle per-item / per-row comparison internally."""
+    and _diff_table handle per-item / per-row comparison internally.
 
-    global _img_diff_cache
-    _img_diff_cache = {}
+    *force_head_pair*: pair block 0 of both sides directly (unit headings
+    are known counterparts from the mapping — never match them heuristically).
+    *head_annotation*: mapping-origin annotation emitted under the base
+    heading of the forced pair (e.g. "Mapped from comparison §5.2.6").
+    *all_new*: emit every base block as 'new' (base-only deep units).
 
-    if not comp_blocks:
-        return '\n\n'.join(base_blocks) + '\n'
+    Returns raw output lines; callers apply _collapse_output once over the
+    (possibly concatenated) result."""
+
+    if not comp_blocks and not all_new:
+        out: list[str] = []
+        for b in base_blocks:
+            out.append(b); out.append('')
+        return out
 
     out: list[str] = []
     bi, ci = 0, 0
@@ -833,6 +855,7 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
         'figure':    0.70,
     }
     _label: str | None = None
+    _pending_head_ann: str | None = None
     bsib = _heading_sibling_counts(base_blocks)
     csib = _heading_sibling_counts(comp_blocks)
 
@@ -874,6 +897,10 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
             out.append(b)
             if cat == 'heading':
                 out.append('')
+                if _pending_head_ann:
+                    out.append(f'> **{_pending_head_ann}**')
+                    out.append('>')
+                    out.append('')
             elif cat == 'figure' and base_img_dir and comp_img_dir and c:
                 ann = _cached_compare_images(b, c, base_img_dir, comp_img_dir)
                 _emit_comp(out, [ann or '*Unchanged.*'], comp_version)
@@ -890,6 +917,10 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
         elif tag == 'replace':
             if cat == 'heading':
                 out.append(b); out.append('')
+                if _pending_head_ann:
+                    out.append(f'> **{_pending_head_ann}**')
+                    out.append('>')
+                    out.append('')
                 _emit_comp(out, [c], comp_version)
             elif cat == 'list':
                 bo, co = _diff_list(b, c)
@@ -967,6 +998,72 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
             else: break
         return n
 
+    def _salvage_remaining() -> None:
+        """Last-resort pairing of the remaining blocks before giving up.
+
+        Pass 1: score all same-category (base, comp) pairs above threshold
+        and keep the best pairs greedily (each block consumed once).
+        Pass 2: enforce monotone order (comp indices increasing along base
+        order), then emit pairs/new/deleted in base order.  Without this a
+        single failed Manhattan resync dumps every remaining block as
+        NEW/DELETED."""
+        nonlocal bi, ci
+        cands = []
+        for i in range(bi, blen):
+            bcat = _classify(base_blocks[i])
+            th = THRESHOLDS.get(bcat, 0.40)
+            for j in range(ci, clen):
+                ccat = _classify(comp_blocks[j])
+                if bcat == ccat:
+                    sim = _block_similarity(base_blocks[i], comp_blocks[j])
+                    if sim >= th:
+                        cands.append((sim, i, j))
+                elif MATCH_LIST_PARAGRAPH and {bcat, ccat} == {'list', 'paragraph'}:
+                    sim = _block_similarity(base_blocks[i], comp_blocks[j])
+                    if sim >= 0.5:
+                        cands.append((sim, i, j))
+        cands.sort(key=lambda t: -t[0])
+        used_b, used_c = set(), set()
+        pairs = []
+        for sim, i, j in cands:
+            if i in used_b or j in used_c: continue
+            used_b.add(i); used_c.add(j)
+            pairs.append((i, j))
+        pairs.sort()
+        kept = []
+        last_j = ci - 1
+        for i, j in pairs:
+            if j > last_j:
+                kept.append((i, j)); last_j = j
+        paired_j = {j for _, j in kept}
+
+        cj = ci
+        for i, j in kept:
+            for i2 in range(bi, i):
+                _emit('new', base_blocks[i2], '')
+            bi = i
+            for j2 in range(cj, j):
+                if j2 not in paired_j:
+                    _emit('deleted', '', comp_blocks[j2])
+            b_blk, c_blk = base_blocks[i], comp_blocks[j]
+            if _classify(b_blk) != _classify(c_blk):
+                # cross-category in salvage: reformatted verdict
+                if log:
+                    log.log(_classify(b_blk), 'reformatted', b_blk, c_blk)
+                out.append(b_blk); out.append('')
+                _emit_comp(out, [c_blk
+                                 + '\n\n*Reformatted (paragraph ⇄ list)*'],
+                           comp_version)
+            else:
+                tag = 'equal' if _normalize_block(b_blk) == _normalize_block(c_blk) else 'replace'
+                _emit(tag, b_blk, c_blk)
+            bi = i + 1; cj = j + 1
+        for i2 in range(bi, blen):
+            _emit('new', base_blocks[i2], '')
+        for j2 in range(cj, clen):
+            _emit('deleted', '', comp_blocks[j2])
+        bi, ci = blen, clen
+
     def _fuzzy_lookahead() -> bool:
         nonlocal bi, ci
         lt = THRESHOLDS.get(comp_cat, 0.40)
@@ -1005,12 +1102,27 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
                         _emit('deleted', '', comp_blocks[j])
                     bi, ci = bx2, cy2
                     return True
-        for i in range(bi, blen):
-            _emit('new', base_blocks[i], '')
-        for j in range(ci, clen):
-            _emit('deleted', '', comp_blocks[j])
-        bi, ci = blen, clen
+        _salvage_remaining()
         return False
+
+    # Base-only deep units: every block is new (matches the historical
+    # rendering when the comparison side is exhausted).
+    if all_new:
+        for b in base_blocks:
+            _emit('new', b, '')
+        return out
+
+    # Unit headings are known counterparts from the mapping — pair them
+    # directly so a heavily renamed heading can never be shredded into
+    # new + deleted by the heuristics below.
+    if force_head_pair and base_blocks and comp_blocks \
+            and _is_heading(base_blocks[0]) and _is_heading(comp_blocks[0]):
+        b0, c0 = base_blocks[0], comp_blocks[0]
+        tag = 'equal' if _normalize_block(b0) == _normalize_block(c0) else 'replace'
+        _pending_head_ann = head_annotation
+        _emit(tag, b0, c0)
+        _pending_head_ann = None
+        bi = ci = 1
 
     while bi < blen or ci < clen:
         if bi >= blen:
@@ -1021,6 +1133,8 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
                 for j in range(ci, clen):
                     c = comp_blocks[j]
                     cat = _classify(c)
+                    if log:
+                        log.log(cat, 'deleted', '', c)
                     if cat == 'table':
                         _, co = _diff_table('', c)
                         for row in co:
@@ -1048,6 +1162,21 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
         comp_cat = _classify(comp_blocks[ci])
 
         if base_cat != comp_cat:
+            # list↔paragraph cross-category pairing (P4 switch)
+            if MATCH_LIST_PARAGRAPH and ({base_cat, comp_cat} == {'list', 'paragraph'}):
+                flat_b = _normalize_block(base_blocks[bi])
+                flat_c = _normalize_block(comp_blocks[ci])
+                if flat_b and flat_c and _block_similarity(
+                        base_blocks[bi], comp_blocks[ci]) >= 0.5:
+                    verdict = 'reformatted'
+                    if log:
+                        log.log(base_cat, verdict, base_blocks[bi], comp_blocks[ci])
+                    out.append(base_blocks[bi]); out.append('')
+                    _emit_comp(out, [comp_blocks[ci]
+                                     + '\n\n*Reformatted (paragraph ⇄ list)*'],
+                               comp_version)
+                    bi += 1; ci += 1
+                    continue
             _fuzzy_lookahead()
             continue
 
@@ -1087,7 +1216,11 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
 
         _fuzzy_lookahead()
 
-    # Collapse blank-line runs
+    return out
+
+
+def _collapse_output(out: list[str]) -> str:
+    """Collapse blank-line runs (max 2) and finalize the interleaved text."""
     result: list[str] = []
     blc = 0
     for line in out:
@@ -1146,12 +1279,6 @@ def parse_report(report_path: Path) -> list[str]:
     return [m.group(1) for m in re.finditer(r'\|\s*✓\s*\|\s*([\d.]+)\s*\|', content)]
 
 
-def find_counterpart(num: str, mapping: list[dict]) -> dict | None:
-    for m in mapping:
-        if m.get('base_num') == num: return m
-    return None
-
-
 def read_section_file(sections_dir: Path, num: str) -> str | None:
     prefix = f'{num}_'
     for f in sorted(sections_dir.iterdir()):
@@ -1160,52 +1287,318 @@ def read_section_file(sections_dir: Path, num: str) -> str | None:
     return None
 
 
-def build_comparison(base_content: str, comp_num: str | None,
-                     comp_heading: str | None, comp_content: str | None,
-                     kind: str | None, comp_version: str = '',
-                     base_img_dir: Path | None = None,
-                     comp_img_dir: Path | None = None,
-                     log: ComparisonLogger | None = None) -> str:
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section-anchored unit engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+RESTRUCTURE_LABEL = ('New in this version '
+                     '(restructured — subsections mapped individually)')
+
+
+@dataclass
+class Unit:
+    kind: str            # 'pair' | 'new' | 'restructure-intro'
+    base_num: str
+    comp_num: str | None
+    base_text: str       # unit markdown; whole subtree for 'new'
+    comp_text: str | None
+    annotation: str | None   # "Mapped from comparison §X.Y" or None
+
+
+def _load_index_sections(index_file: Path) -> dict[str, dict]:
+    """num -> {heading, level, file}, in document order."""
+    with open(str(index_file), encoding='utf-8') as f:
+        return json.load(f)['sections']
+
+
+def _read_unit_intro(sections_dir: Path, num: str,
+                     index_sections: dict[str, dict]) -> str | None:
+    """Read section *num*'s file and return only its own intro content
+    (heading + text before its first direct child heading)."""
+    text = read_section_file(sections_dir, num)
+    if text is None:
+        return None
+    return own_scope(text, index_sections, num)
+
+
+def _iter_units(base_num: str, mapping_by_base: dict[str, dict],
+                base_sections: dict, comp_sections: dict,
+                base_dir: Path, comp_dir: Path,
+                deep_ctx: dict | None = None):
+    """Recursive base-order walk of a subtree, yielding comparison Units.
+
+    The mapping decides where comparison content comes from; the base index
+    decides order — base document order is preserved globally.  With a
+    *deep_ctx*, a section's own scope is further split at its ####/#####
+    headings and those deep nodes are anchored via deep_mapping."""
+    dc = deep_ctx or {}
+    deep_map = dc.get('deep_map', {})
+    bdeep_by_id = dc.get('bdeep_by_id', {})
+    cdeep_by_id = dc.get('cdeep_by_id', {})
+    bdeep_children = dc.get('bdeep_children', {})
+    sec_pair = dc.get('sec_pair', {})
+    scope_cache = dc.setdefault('scope_cache', {}) if deep_ctx is not None else {}
+
+    def comp_scope(cid):
+        """Comparison-side scope text for a deep node id or section num."""
+        if cid in scope_cache:
+            return scope_cache[cid]
+        if '#' in cid:
+            c = cdeep_by_id[cid]
+            parent_text = read_section_file(comp_dir, c['parent'])
+            scope = None
+            if parent_text is not None:
+                scope = slice_heading_scope(
+                    own_scope(parent_text, comp_sections, c['parent']),
+                    c['path'], c['hashes'], c['occurrence'])
+        else:
+            text = read_section_file(comp_dir, cid)
+            scope = own_scope(text, comp_sections, cid) if text else None
+        scope_cache[cid] = scope
+        return scope
+
+    def base_deep_scope(node):
+        parent_text = read_section_file(base_dir, node['parent'])
+        if parent_text is None:
+            return ''
+        return slice_heading_scope(
+            own_scope(parent_text, base_sections, node['parent']),
+            node['path'], node['hashes'], node['occurrence']) or ''
+
+    def deep_annotation(base_parent, rec):
+        cid = rec['comp_num']
+        if '#' in cid:
+            c = cdeep_by_id[cid]
+            if c['parent'] == sec_pair.get(base_parent):
+                return None
+            return (f"Mapped from comparison §{c['parent']} › "
+                    + ' › '.join(c['path']))
+        return f'Mapped from comparison §{cid}'
+
+    def iter_deep(node_id):
+        node = bdeep_by_id[node_id]
+        rec = deep_map.get(node_id)
+        kind = rec['kind'] if rec else 'new'
+        children = bdeep_children.get(node_id, [])
+        if kind == 'same':
+            cid = rec['comp_num']
+            base_text = _cut_at_first_deep(base_deep_scope(node))
+            ct = comp_scope(cid)
+            comp_text = _cut_at_first_deep(ct) if ct is not None else None
+            yield Unit('pair', node_id, cid, base_text, comp_text,
+                       deep_annotation(node['parent'], rec))
+            for ch in children:
+                yield from iter_deep(ch)
+        elif kind == 'restructure' or (kind == 'new' and any(
+                deep_map.get(ch, {}).get('kind') == 'same'
+                or _deep_same_below(ch, deep_map, bdeep_children)
+                for ch in children)):
+            yield Unit('deep-new', node_id, None,
+                       _cut_at_first_deep(base_deep_scope(node)), None, None)
+            for ch in children:
+                yield from iter_deep(ch)
+        else:
+            yield Unit('deep-new', node_id, None, base_deep_scope(node),
+                       None, None)
+
+    def section_units(num):
+        rec = mapping_by_base.get(num)
+        kind = rec['kind'] if rec else 'new'
+        if rec is None:
+            log.warning('§%s missing from mapping — treating as new', num)
+        upgrade = deep_map.get(num)  # cross-granularity: section ↔ comp pseudo
+        top_deep = bdeep_children.get(num, [])
+
+        if kind == 'same' or upgrade:
+            if kind == 'same':
+                comp_num = rec['comp_num']
+                ct = _read_unit_intro(comp_dir, comp_num, comp_sections)
+                ann = (f'Mapped from comparison §{comp_num}'
+                       if num != comp_num else None)
+            else:
+                comp_num = upgrade['comp_num']
+                ct = comp_scope(comp_num)
+                ann = deep_annotation(num, upgrade)
+            base_intro = _read_unit_intro(base_dir, num, base_sections) or ''
+            comp_intro = _cut_at_first_deep(ct) if ct is not None else None
+            yield Unit('pair', num, comp_num,
+                       _cut_at_first_deep(base_intro), comp_intro, ann)
+            for d in top_deep:
+                yield from iter_deep(d)
+            for child in direct_children(num, base_sections):
+                yield from section_units(child)
+            return
+
+        has_matches = (
+            any(d.startswith(num + '.') and r['kind'] == 'same'
+                for d, r in mapping_by_base.items())
+            or any(deep_map.get(d, {}).get('kind') == 'same' or deep_map.get(d, {}).get('fixup')
+                   for d in deep_map
+                   if ('#' in d and (d.split('#')[0] == num
+                                     or d.split('#')[0].startswith(num + '.')))
+                   or ('#' not in d and d.startswith(num + '.')))
+        )
+        if kind == 'restructure' or has_matches:
+            intro = _read_unit_intro(base_dir, num, base_sections) or ''
+            yield Unit('restructure-intro', num, None,
+                       _cut_at_first_deep(intro), None, None)
+            for d in top_deep:
+                yield from iter_deep(d)
+            for child in direct_children(num, base_sections):
+                yield from section_units(child)
+        else:
+            yield Unit('new', num, None,
+                       read_section_file(base_dir, num) or '', None, None)
+
+    yield from section_units(base_num)
+
+
+def _deep_same_below(node_id, deep_map, bdeep_children):
+    for ch in bdeep_children.get(node_id, []):
+        r = deep_map.get(ch)
+        if r and r['kind'] == 'same':
+            return True
+        if _deep_same_below(ch, deep_map, bdeep_children):
+            return True
+    return False
+
+
+def _cut_at_first_deep(text: str) -> str:
+    """Cut a scope at its first deep-heading child (line 0 is the scope's
+    own heading and is kept)."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if i == 0:
+            continue
+        if DEEP_ANCHOR_RE.match(line):
+            return '\n'.join(lines[:i])
+    return text
+
+
+def _compare_unit(base_text: str, comp_text: str, annotation: str | None,
+                  comp_version: str,
+                  base_img_dir: Path | None, comp_img_dir: Path | None,
+                  logger: ComparisonLogger | None) -> list[str]:
+    """Run the block pipeline on one paired unit; returns raw output lines."""
+    base_blocks = _merge_split_numbered_lists(
+        _split_all(_split_blocks(_strip_blockquotes(base_text))))
+    comp_blocks = _merge_split_numbered_lists(
+        _split_all(_split_blocks(_strip_blockquotes(comp_text))))
+    return _process_blocks(base_blocks, comp_blocks, comp_version,
+                           base_img_dir, comp_img_dir, logger,
+                           force_head_pair=True, head_annotation=annotation)
+
+
+def _emit_new_unit(unit_text: str, label: str,
+                   logger: ComparisonLogger | None,
+                   log_verdict: str) -> list[str]:
+    """Whole-unit rendering for base-only units: heading, annotation
+    blockquote, then the unit content verbatim."""
+    text = unit_text.strip()
+    nl = text.find('\n')
+    heading = text if nl == -1 else text[:nl]
+    rest = '' if nl == -1 else text[nl + 1:].strip()
+    if logger:
+        logger.log('section', log_verdict, heading)
+    out = [heading, '', f'> **{label}**', '>', '']
+    if rest:
+        out.append(rest)
+        out.append('')
+    return out
+
+
+def build_section_comparison(num: str, base_content: str, record: dict | None,
+                             mapping_by_base: dict[str, dict],
+                             base_sections: dict, comp_sections: dict,
+                             cfg, logger: ComparisonLogger | None,
+                             deep_ctx: dict | None = None) -> str:
+    """Orchestrate the comparison of one checked section (whole subtree),
+    anchored on the section mapping and the deep mapping."""
+    kind = record['kind'] if record else 'new'
+    comp_num = record.get('comp_num') if record else None
+    comp_heading = record.get('comp_heading') if record else None
+    upgrade = (deep_ctx or {}).get('deep_map', {}).get(num)
+    cv = cfg.comparison.version_display
+
     lines: list[str] = []
-    if kind == 'new_section' or comp_num is None:
-        lines.append('> **New in this version**'); lines.append('>')
-    elif kind == 'deleted_in_base':
-        lines.append(f'> **Removed from this version (was comparison §{comp_num or "?"})**')
-        lines.append('>')
-    elif comp_num:
+    if kind == 'same':
         lines.append(f'> **Mapped from comparison §{comp_num}**'); lines.append('>')
+    elif upgrade:
+        cid = upgrade['comp_num']
+        if '#' in cid:
+            c = (deep_ctx or {}).get('cdeep_by_id', {}).get(cid, {})
+            lines.append(f"> **Mapped from comparison §{c.get('parent', '?')} › "
+                         + ' › '.join(c.get('path', [])) + '**')
+        else:
+            lines.append(f'> **Mapped from comparison §{cid}**')
+        lines.append('>')
+    elif kind == 'restructure':
+        lines.append(f'> **{RESTRUCTURE_LABEL}**'); lines.append('>')
+    else:
+        lines.append('> **New in this version**'); lines.append('>')
     lines.append('')
 
-    if not comp_content:
-        lines.append(base_content.strip())
-        if comp_num:
-            lines.append('')
-            lines.append(f'> **Comparison §{comp_num}**'
-                         f'{f" — {comp_heading}" if comp_heading else ""}')
-            lines.append('>')
-            lines.append('> *(Comparison section not yet extracted. Run extract_all.py first.)*')
-            lines.append('>')
+    global _img_diff_cache
+    _img_diff_cache = {}
+
+    units = _iter_units(num, mapping_by_base, base_sections, comp_sections,
+                        cfg.base.sections_dir, cfg.comparison.sections_dir,
+                        deep_ctx)
+    first = next(units, None)
+    if first is not None and first.kind == 'new' and first.base_num == num:
+        # Whole checked section is new (no matches anywhere below):
+        # header + verbatim content, historical shape.
+        lines.append(first.base_text.strip())
         return '\n'.join(lines) + '\n'
 
-    base_content = _strip_blockquotes(base_content)
-    comp_content = _strip_blockquotes(comp_content)
-    base_blocks = _split_blocks(base_content)
-    comp_blocks = _split_blocks(comp_content)
+    unit_iter = itertools.chain([first], units) if first is not None else units
 
-    # Split body paragraphs into individual blocks; lists and tables stay whole
-    base_blocks = _split_all(base_blocks)
-    comp_blocks = _split_all(comp_blocks)
+    unit_lines: list[str] = []
+    for u in unit_iter:
+        if u.kind == 'pair':
+            label = '[same, moved]' if u.annotation else '[same]'
+            if logger:
+                logger.unit(f'§{u.base_num} <-> §{u.comp_num} {label}')
+            if u.comp_text is None:
+                log.warning('§%s: comparison §%s content missing',
+                            u.base_num, u.comp_num)
+                unit_lines.append(u.base_text.strip())
+                unit_lines.append('')
+                unit_lines.append(f'> **Comparison §{u.comp_num}**')
+                unit_lines.append('>')
+                unit_lines.append('> *(Comparison section not yet extracted. '
+                                  'Run extract_all.py first.)*')
+                unit_lines.append('>')
+                unit_lines.append('')
+                continue
+            unit_lines.extend(_compare_unit(
+                u.base_text, u.comp_text, u.annotation, cv,
+                cfg.base.images_dir, cfg.comparison.images_dir, logger))
+        elif u.kind == 'deep-new':
+            if logger:
+                logger.unit(f'§{u.base_num} [deep new]')
+            blocks = _merge_split_numbered_lists(
+                _split_all(_split_blocks(_strip_blockquotes(u.base_text))))
+            unit_lines.extend(_process_blocks(
+                blocks, [], cv, cfg.base.images_dir,
+                cfg.comparison.images_dir, logger, all_new=True))
+        elif u.kind == 'new':
+            if logger:
+                logger.unit(f'§{u.base_num} [new]')
+            unit_lines.extend(_emit_new_unit(
+                u.base_text, 'New in this version', logger, 'new'))
+        else:  # restructure-intro
+            if logger:
+                logger.unit(f'§{u.base_num} [restructure]')
+            unit_lines.extend(_emit_new_unit(
+                u.base_text, RESTRUCTURE_LABEL, logger, 'restructure'))
 
-    base_blocks = _merge_split_numbered_lists(base_blocks)
-    comp_blocks = _merge_split_numbered_lists(comp_blocks)
-
-    interleaved = _process_blocks(base_blocks, comp_blocks, comp_version,
-                                  base_img_dir, comp_img_dir, log)
-    lines.append(interleaved)
-    lines.append('')
-    lines.append(f'> **Comparison §{comp_num}**'
-                 f'{f" — {comp_heading}" if comp_heading else ""}')
-    lines.append('>')
+    lines.append(_collapse_output(unit_lines))
+    if kind == 'same':
+        lines.append('')
+        lines.append(f'> **Comparison §{comp_num}**'
+                     f'{f" — {comp_heading}" if comp_heading else ""}')
+        lines.append('>')
     return '\n'.join(lines) + '\n'
 
 
@@ -1213,10 +1606,39 @@ def main():
     cfg = load_config()
     if not cfg.mapping_file.exists():
         log.error('Mapping file not found: %s', cfg.mapping_file)
-        log.error('Run extract_all.py first to generate the mapping.')
+        log.error('Run map_sections.py first to generate the mapping.')
         sys.exit(1)
     with open(cfg.mapping_file, encoding='utf-8') as f:
         mapping = json.load(f)
+    mapping_by_base = {r['base_num']: r for r in mapping if r.get('base_num')}
+    base_sections = _load_index_sections(cfg.base.index_file)
+    comp_sections = _load_index_sections(cfg.comparison.index_file)
+
+    deep_path = cfg.mapping_file.parent / 'deep_mapping.json'
+    if not deep_path.exists():
+        log.error('Deep mapping not found: %s', deep_path)
+        log.error('Run map_sections.py (and map_fixups.py) first.')
+        sys.exit(1)
+    with open(str(deep_path), encoding='utf-8') as f:
+        deep_rows = json.load(f)
+    bdeep = collect_deep_headings(cfg.base.sections_dir, base_sections)
+    cdeep = collect_deep_headings(cfg.comparison.sections_dir, comp_sections)
+    bdeep_children: dict[str, list[str]] = {}
+    for d in bdeep:
+        bdeep_children.setdefault(d['container'], []).append(d['id'])
+    deep_ctx = {
+        'deep_map': {r['base_num']: r for r in deep_rows if r['base_num']},
+        'bdeep_by_id': {d['id']: d for d in bdeep},
+        'cdeep_by_id': {d['id']: d for d in cdeep},
+        'bdeep_children': bdeep_children,
+        'sec_pair': {r['base_num']: r['comp_num'] for r in mapping
+                     if r.get('base_num') and r.get('comp_num')},
+    }
+
+    if len(sys.argv) >= 2 and sys.argv[1] == '--strict-categories':
+        global MATCH_LIST_PARAGRAPH
+        MATCH_LIST_PARAGRAPH = False
+        sys.argv.pop(1)
 
     if len(sys.argv) >= 2:
         rp = Path(sys.argv[1])
@@ -1224,8 +1646,7 @@ def main():
         section_nums = parse_report(rp)
         print(f'Parsed {len(section_nums)} checked sections from {rp.name}')
     else:
-        section_nums = [m['base_num'] for m in mapping
-                        if m.get('base_num') and m.get('kind') != 'deleted_in_base']
+        section_nums = list(mapping_by_base)
         print(f'Comparing all {len(section_nums)} mapped sections')
 
     if not section_nums:
@@ -1235,16 +1656,14 @@ def main():
     os.makedirs(str(out_dir), exist_ok=True)
 
     created = 0
-    log = ComparisonLogger(out_dir)
+    clog = ComparisonLogger(out_dir)
     for num in section_nums:
         bc = read_section_file(cfg.base.sections_dir, num)
         if bc is None:
             log.warning('SKIP §%s: not found in base sections', num); continue
 
-        m = find_counterpart(num, mapping)
-        cn = m['comp_num'] if m else None
-        ch = m['comp_heading'] if m else None
-        kd = m['kind'] if m else None
+        record = mapping_by_base.get(num)
+        cn = record['comp_num'] if record else None
         cc = read_section_file(cfg.comparison.sections_dir, cn) if cn else None
 
         # Determine output filename first
@@ -1254,15 +1673,13 @@ def main():
                 fn = f.name.replace('.md', '_comparison.md'); break
         if fn is None: fn = f'{num}_comparison.md'
 
-        log.start(fn.replace('_comparison.md', ''),
-                  len(_split_blocks(bc)),
-                  len(_split_blocks(cc)) if cc else 0)
+        clog.start(fn.replace('_comparison.md', ''),
+                   len(_split_blocks(bc)),
+                   len(_split_blocks(cc)) if cc else 0)
 
-        cv = cfg.comparison.version_display
-        text = build_comparison(bc, cn, ch, cc, kd, cv,
-                                base_img_dir=cfg.base.images_dir,
-                                comp_img_dir=cfg.comparison.images_dir,
-                                log=log)
+        text = build_section_comparison(num, bc, record, mapping_by_base,
+                                        base_sections, comp_sections,
+                                        cfg, clog, deep_ctx)
 
         _copy_assets(text,
                      cfg.base.images_dir, cfg.base.tables_dir,
@@ -1271,7 +1688,7 @@ def main():
         text = _rewrite_assets(text, cfg.base.version, cfg.comparison.version)
         (out_dir / fn).write_text(text, encoding='utf-8')
         created += 1
-        log.end()
+        clog.end()
 
     print(f'Created {created} comparison files in {out_dir.relative_to(Path(ROOT))}')
 

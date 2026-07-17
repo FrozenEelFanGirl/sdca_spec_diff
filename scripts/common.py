@@ -150,11 +150,33 @@ def parse_toc(doc_xml_bytes):
         if 'PAGEREF' not in instr:
             continue
 
-        full_text = ''.join(t.text or '' for t in child.iter(f'{{{W}}}t')).strip()
-        m = re.match(r'^([\d]+(?:\.[\d]+)*)(.+?)(\d+)$', full_text)
-        if m:
-            num = m.group(1)
-            heading = m.group(2).strip()
+        # TOC entry structure: <num> <tab> <heading> <tab> <PAGEREF page>.
+        # Split on tab runs and stop at the PAGEREF field so headings that
+        # end in digits (e.g. "... IT11") are not confused with the page
+        # number.
+        segments = ['']
+        for el in child.iter():
+            if el.tag == f'{{{W}}}fldChar':
+                break
+            if el.tag == f'{{{W}}}tab':
+                segments.append('')
+            elif el.tag == f'{{{W}}}t' and el.text:
+                segments[-1] += el.text
+
+        num, heading = None, None
+        parts = [s.strip() for s in segments if s.strip()]
+        if len(parts) >= 2:
+            if re.match(r'^[\d]+(?:\.[\d]+)*$', parts[0]):
+                num, heading = parts[0], parts[1]
+        if num is None:
+            # Fallback for entries without the tab structure. The trailing
+            # (\d+) is the page number; headings ending in digits may lose
+            # them here.
+            full_text = ''.join(t.text or '' for t in child.iter(f'{{{W}}}t')).strip()
+            m = re.match(r'^([\d]+(?:\.[\d]+)*)(.+?)(\d+)$', full_text)
+            if m:
+                num, heading = m.group(1), m.group(2).strip()
+        if num:
             toc_entries.append((num, heading))
 
     num_to_heading = {}
@@ -296,9 +318,140 @@ def get_list_indent(style_id):
 # ── File naming ─────────────────────────────────────────────────────────────
 
 def section_file(num, heading):
-    """Generate section file name from section number and heading."""
-    slug = re.sub(r'[^\w\s-]', '', heading).strip().replace(' ', '_')
+    """Generate section file name from section number and heading.
+
+    Punctuation is stripped first, then all whitespace (including NBSP and
+    en-spaces) is collapsed to single underscores, so index and extraction
+    derive identical names from slightly different heading sources.
+    """
+    slug = re.sub(r'[^\w\s-]', '', heading)
+    slug = re.sub(r'\s+', ' ', slug).strip().replace(' ', '_')
     return f'{num}_{slug}.md'
+
+
+# ── Deep-heading (####/#####) anchoring ─────────────────────────────────────
+# Deep headings are mapping nodes below section numbering.  ###### lines, if
+# they ever appear, are original paragraph text (notes) — never anchors and
+# never scope boundaries.
+
+DEEP_ANCHOR_RE = re.compile(r'^(#{4,5})\s+(.*)$')
+
+
+def unescape_heading(h):
+    """Undo markdown escapes so heading text compares across index and files."""
+    return h.replace(r'\<', '<').replace(r'\>', '>').replace(r'\*', '*')
+
+
+def direct_children(num, sections):
+    """Section numbers one level below *num*, in document order."""
+    depth = len(num.split('.')) + 1
+    prefix = num + '.'
+    return [k for k in sections
+            if k.startswith(prefix) and len(k.split('.')) == depth]
+
+
+def own_scope(text, sections, num):
+    """A section's own content: its subtree text cut at the first
+    child-section heading."""
+    kids = direct_children(num, sections)
+    if not kids:
+        return text
+    info = sections[kids[0]]
+    hashes = '#' * (info['level'] + 1)
+    target = unescape_heading(info['heading'].strip())
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        m = re.match(r'^(#+)\s+(.*)$', line)
+        if m and m.group(1) == hashes and unescape_heading(m.group(2).strip()) == target:
+            return '\n'.join(lines[:i])
+    for i, line in enumerate(lines):
+        m = re.match(r'^(#+)\s', line)
+        if m and m.group(1) == hashes:
+            get_logger('common').warning(
+                'own_scope: child heading %r not found verbatim in §%s; '
+                'cutting at first level-%d heading', target, num, len(hashes))
+            return '\n'.join(lines[:i])
+    get_logger('common').warning(
+        'own_scope: no level-%d heading found in §%s; using whole text',
+        len(hashes), num)
+    return text
+
+
+def collect_deep_headings(sections_dir, sections):
+    """Inventory of ####/##### headings within each section's own scope.
+
+    Returns a list of records in document order:
+      {id, parent, container, path, heading, hashes, occurrence, order}
+    *id* is '<parent>#<path joined with #>', with ' [n]' appended on exact
+    path collisions; *occurrence* is that collision ordinal (for slicing);
+    *container* is the immediate enclosing node id (a pseudo id, or the
+    parent section number for top-level deep headings).
+    """
+    out = []
+    order = 0
+    for num, e in sections.items():
+        fname = e['file'].rsplit('/', 1)[-1]
+        fpath = os.path.join(str(sections_dir), fname)
+        if not os.path.exists(fpath):
+            continue
+        with open(fpath, encoding='utf-8') as f:
+            text = f.read()
+        text = own_scope(text, sections, num)
+        stack = []
+        seen = {}
+        for line in text.split('\n'):
+            m = DEEP_ANCHOR_RE.match(line)
+            if not m:
+                continue
+            h = len(m.group(1))
+            t = unescape_heading(m.group(2).strip())
+            while stack and stack[-1][0] >= h:
+                stack.pop()
+            path = [s[1] for s in stack] + [t]
+            base_id = num + '#' + '#'.join(path)
+            n = seen.get(base_id, 0) + 1
+            seen[base_id] = n
+            node_id = base_id if n == 1 else f'{base_id} [{n}]'
+            container = stack[-1][2] if stack else num
+            out.append({'id': node_id, 'parent': num, 'container': container,
+                        'path': path, 'heading': t, 'hashes': h,
+                        'occurrence': n, 'order': order})
+            stack.append((h, t, node_id))
+            order += 1
+    return out
+
+
+def slice_heading_scope(text, path, hashes, occurrence=1):
+    """Slice a deep node's scope out of its parent section's own-scope text:
+    from the heading whose path matches, to the next heading with hash count
+    <= its own.  Returns None if not found."""
+    lines = text.split('\n')
+    stack = []
+    count = 0
+    start = None
+    for i, line in enumerate(lines):
+        m = re.match(r'^(#{1,6})\s+(.*)$', line)
+        if not m:
+            continue
+        h = len(m.group(1))
+        if start is not None:
+            if h <= hashes:
+                return '\n'.join(lines[start:i])
+            continue
+        if h < 4 or h > 5:
+            continue
+        t = unescape_heading(m.group(2).strip())
+        while stack and stack[-1][0] >= h:
+            stack.pop()
+        cur = [s[1] for s in stack] + [t]
+        stack.append((h, t))
+        if h == hashes and cur == list(path):
+            count += 1
+            if count == occurrence:
+                start = i
+    if start is not None:
+        return '\n'.join(lines[start:])
+    return None
 
 
 # ── Cross-reference resolution ──────────────────────────────────────────────

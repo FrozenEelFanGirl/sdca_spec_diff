@@ -37,7 +37,7 @@ from lxml import etree
 
 from common import (
     W, NS, TOC_STYLES, FIGURE_TITLE_STYLES, TABLE_TITLE_STYLES,
-    parse_toc, build_style_map, para_to_markdown, parse_xml,
+    parse_toc, build_style_map, para_to_markdown, parse_xml, section_file,
 )
 
 
@@ -59,11 +59,10 @@ def build_index(docx_path):
     }
 
     for num, heading in num_to_heading.items():
-        slug = re.sub(r'[^\w\s-]', '', heading).strip().replace(' ', '_')
         index['sections'][num] = {
             'heading': heading,
             'level': num.count('.'),
-            'file': f'../sections/{num}_{slug}.md',
+            'file': f'../sections/{section_file(num, heading)}',
         }
 
     # Also scan body paragraphs for headings not captured by the TOC
@@ -116,11 +115,10 @@ def build_index(docx_path):
         heading = re.sub(r'^[\dA-Z\.]+\s*', '', text).strip()
 
         if num not in index['sections']:
-            slug = re.sub(r'[^\w\s-]', '', heading).strip().replace(' ', '_')
             index['sections'][num] = {
                 'heading': heading,
                 'level': lvl,
-                'file': f'../sections/{num}_{slug}.md',
+                'file': f'../sections/{section_file(num, heading)}',
             }
 
     # Scan for figure and table captions
