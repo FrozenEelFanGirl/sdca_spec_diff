@@ -56,6 +56,7 @@ from diff_images import diff_images
 log = get_logger('compare_sections')
 
 MATCH_LIST_PARAGRAPH = True  # allow list↔paragraph cross-category pairing
+CROSS_CATEGORY_BOOST = 0.15   # bonus added to similarity when categories differ
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -399,15 +400,21 @@ def _diff_words(base_text: str, comp_text: str) -> tuple[str, str]:
                     bt = bl[i1 + k] if k < i2 - i1 else ''
                     ct = cl[j1 + k] if k < j2 - j1 else ''
                     if bt and ct: ab, ac = _diff_words(bt, ct); bo.append(ab); co.append(ac)
-                    elif bt: bo.append('**' + bt + '**')
-                    elif ct: co.append('~~' + ct + '~~')
+                    elif bt: bo.append(_wrap_list_aware(bt, '**'))
+                    elif ct: co.append(_wrap_list_aware(ct, '~~'))
             elif tag == 'delete':
-                for k in range(i1, i2): bo.append('**' + bl[k] + '**')
+                for k in range(i1, i2): bo.append(_wrap_list_aware(bl[k], '**'))
             elif tag == 'insert':
-                for k in range(j1, j2): co.append('~~' + cl[k] + '~~')
+                for k in range(j1, j2): co.append(_wrap_list_aware(cl[k], '~~'))
         return '\n'.join(bo), '\n'.join(co)
 
     bp, bu = _protect_urls(base_text); cp, cu = _protect_urls(comp_text)
+    # _re.findall(r'\S+') drops leading whitespace; capture it so indentation survives
+    b_lead = ''; c_lead = ''
+    blm = re.match(r'^(\s+)', bp)
+    if blm: b_lead = blm.group(1)
+    clm = re.match(r'^(\s+)', cp)
+    if clm: c_lead = clm.group(1)
     bw = re.findall(r'\S+', bp); cw = re.findall(r'\S+', cp)
     sm = SequenceMatcher(None, [w.lower() for w in bw], [w.lower() for w in cw])
     bp_: list[str] = []; cp_: list[str] = []
@@ -425,25 +432,65 @@ def _diff_words(base_text: str, comp_text: str) -> tuple[str, str]:
             for k in range(n):
                 ba = bw[i1 + k] if k < i2 - i1 else ''
                 ca = cw[j1 + k] if k < j2 - j1 else ''
-                if not ba: cp_sub.append('~~' + ca + '~~')
-                elif not ca: bp_sub.append('**' + ba + '**')
+                # Don't wrap a bare list number (e.g. "2.") at line start
+                ba_at_start = (i1 + k == 0)
+                ca_at_start = (j1 + k == 0)
+                ba_is_list = ba_at_start and re.match(r'^\d+\.$', ba)
+                ca_is_list = ca_at_start and re.match(r'^\d+\.$', ca)
+                if not ba: cp_sub.append(ca if ca_is_list else '~~' + ca + '~~')
+                elif not ca: bp_sub.append(ba if ba_is_list else '**' + ba + '**')
                 elif _strip_punct(ba) == _strip_punct(ca):
                     bp_sub.append(ba); cp_sub.append(ca)
                 else:
-                    bp_sub.append('**' + ba + '**')
-                    cp_sub.append('**' + ca + '**')
+                    bp_sub.append(ba if ba_is_list else '**' + ba + '**')
+                    cp_sub.append(ca if ca_is_list else '**' + ca + '**')
             bp_.append(' '.join(bp_sub))
             cp_.append(' '.join(cp_sub))
         elif tag == 'delete':
-            bp_.append('**' + ' '.join(bw[i1:i2]) + '**')
+            bp_.append(_wrap_list_aware(' '.join(bw[i1:i2]), '**'))
         elif tag == 'insert':
-            cp_.append('~~' + ' '.join(cw[j1:j2]) + '~~')
-    return _restore_urls(' '.join(bp_), bu), _restore_urls(' '.join(cp_), cu)
+            cp_.append(_wrap_list_aware(' '.join(cw[j1:j2]), '~~'))
+    return (_restore_urls(b_lead + ' '.join(bp_), bu),
+            _restore_urls(c_lead + ' '.join(cp_), cu))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # List diff
 # ═══════════════════════════════════════════════════════════════════════════════
+
+_LIST_RE = re.compile(r'^(\s*(?:\d+\.\s|[-*]\s))(.*)', re.DOTALL)
+
+
+def _wrap_list_aware(line: str, marker: str) -> str:
+    """Wrap *line* in *marker*, keeping list markers (1. / - / *) outside."""
+    m = _LIST_RE.match(line)
+    if m:
+        return m.group(1) + marker + m.group(2) + marker
+    return marker + line + marker
+
+
+def _wrap_marker_per_line(text: str, marker: str, prefix: str = '') -> str:
+    """Wrap each line of *text* in *marker* so **/~~ never cross newlines.
+    *prefix* is prepended to the first line only (outside the marker).
+    List markers on each line are kept outside the marker via _wrap_list_aware."""
+    lines = text.split('\n')
+    if not lines:
+        return prefix
+
+    if prefix:
+        m = _LIST_RE.match(lines[0])
+        if m:
+            lines[0] = prefix + m.group(1) + marker + m.group(2) + marker
+        else:
+            lines[0] = prefix + marker + lines[0] + marker
+    else:
+        lines[0] = _wrap_list_aware(lines[0], marker)
+
+    for i in range(1, len(lines)):
+        lines[i] = _wrap_list_aware(lines[i], marker)
+
+    return '\n'.join(lines)
+
 
 def _split_marker(item: str) -> tuple[str, str]:
     """Split a list item into (marker, content).  Marker includes indentation
@@ -473,7 +520,7 @@ def _diff_list(base_block: str, comp_block: str) -> tuple[list[str], list[str]]:
     if not ci:
         for item in bi:
             bm, bt = _split_marker(item)
-            bo.append(bm + '**' + bt + '**')
+            bo.append(_wrap_marker_per_line(bt, '**', bm))
         return bo, []
 
     # All deleted (base empty) — strikethrough comp items, base gets
@@ -481,7 +528,7 @@ def _diff_list(base_block: str, comp_block: str) -> tuple[list[str], list[str]]:
     if not bi:
         for item in ci:
             cm, ct = _split_marker(item)
-            co.append(cm + '~~' + ct + '~~')
+            co.append(_wrap_marker_per_line(ct, '~~', cm))
         return bo, co
 
     # Same count → 1-to-1
@@ -539,14 +586,14 @@ def _diff_list(base_block: str, comp_block: str) -> tuple[list[str], list[str]]:
         else:
             # No comp match — this base item is new
             bm, bt = _split_marker(b_item)
-            bo.append(bm + '**' + bt + '**')
+            bo.append(_wrap_marker_per_line(bt, '**', bm))
             co.append(bm + '*New in this version*')
 
     # Append comp-only items at the end (deleted from base)
     for j, c_item in enumerate(ci):
         if j not in used_comp:
             cm, ct = _split_marker(c_item)
-            co.append(cm + '~~' + ct + '~~')
+            co.append(_wrap_marker_per_line(ct, '~~', cm))
             bo.append(cm + '**Removed in this version**')
     return bo, co
 
@@ -1020,7 +1067,7 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
                         cands.append((sim, i, j))
                 elif MATCH_LIST_PARAGRAPH and {bcat, ccat} == {'list', 'paragraph'}:
                     sim = _block_similarity(base_blocks[i], comp_blocks[j])
-                    if sim >= 0.5:
+                    if sim + CROSS_CATEGORY_BOOST >= th:
                         cands.append((sim, i, j))
         cands.sort(key=lambda t: -t[0])
         used_b, used_c = set(), set()
@@ -1047,13 +1094,11 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
                     _emit('deleted', '', comp_blocks[j2])
             b_blk, c_blk = base_blocks[i], comp_blocks[j]
             if _classify(b_blk) != _classify(c_blk):
-                # cross-category in salvage: reformatted verdict
+                # cross-category in salvage: show both blocks
                 if log:
                     log.log(_classify(b_blk), 'reformatted', b_blk, c_blk)
                 out.append(b_blk); out.append('')
-                _emit_comp(out, [c_blk
-                                 + '\n\n*Reformatted (paragraph ⇄ list)*'],
-                           comp_version)
+                _emit_comp(out, [c_blk], comp_version)
             else:
                 tag = 'equal' if _normalize_block(b_blk) == _normalize_block(c_blk) else 'replace'
                 _emit(tag, b_blk, c_blk)
@@ -1164,17 +1209,14 @@ def _process_blocks(base_blocks: list[str], comp_blocks: list[str],
         if base_cat != comp_cat:
             # list↔paragraph cross-category pairing (P4 switch)
             if MATCH_LIST_PARAGRAPH and ({base_cat, comp_cat} == {'list', 'paragraph'}):
-                flat_b = _normalize_block(base_blocks[bi])
-                flat_c = _normalize_block(comp_blocks[ci])
-                if flat_b and flat_c and _block_similarity(
-                        base_blocks[bi], comp_blocks[ci]) >= 0.5:
-                    verdict = 'reformatted'
+                sim = _block_similarity(base_blocks[bi], comp_blocks[ci])
+                th = THRESHOLDS.get('paragraph', 0.40)
+                if sim + CROSS_CATEGORY_BOOST >= th:
                     if log:
-                        log.log(base_cat, verdict, base_blocks[bi], comp_blocks[ci])
+                        log.log(base_cat, 'reformatted',
+                                base_blocks[bi], comp_blocks[ci])
                     out.append(base_blocks[bi]); out.append('')
-                    _emit_comp(out, [comp_blocks[ci]
-                                     + '\n\n*Reformatted (paragraph ⇄ list)*'],
-                               comp_version)
+                    _emit_comp(out, [comp_blocks[ci]], comp_version)
                     bi += 1; ci += 1
                     continue
             _fuzzy_lookahead()
@@ -1279,11 +1321,25 @@ def parse_report(report_path: Path) -> list[str]:
     return [m.group(1) for m in re.finditer(r'\|\s*✓\s*\|\s*([\d.]+)\s*\|', content)]
 
 
+def _strip_source_formatting(text: str) -> str:
+    """Strip *italic*, **bold**, and ***bold-italic*** from extracted markdown
+    so they don't collide with **/~~ diff annotations during comparison.
+
+    Longest-delimiter first so *** doesn't get half-stripped by the ** step.
+    No re.DOTALL — OOXML formatting runs never cross paragraphs, and DOTALL
+    causes false matches when adjacent bold boundaries (e.g. ``**a****b**``)
+    form ``***`` that pairs with another ``***`` far away in the text."""
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    return text
+
+
 def read_section_file(sections_dir: Path, num: str) -> str | None:
     prefix = f'{num}_'
     for f in sorted(sections_dir.iterdir()):
         if f.name.startswith(prefix) and f.suffix == '.md':
-            return f.read_text(encoding='utf-8')
+            return _strip_source_formatting(f.read_text(encoding='utf-8'))
     return None
 
 
@@ -1306,9 +1362,14 @@ class Unit:
 
 
 def _load_index_sections(index_file: Path) -> dict[str, dict]:
-    """num -> {heading, level, file}, in document order."""
+    """num -> {heading, level, file}, in document order.
+    Headings are stripped of source formatting so they match the text
+    returned by read_section_file."""
     with open(str(index_file), encoding='utf-8') as f:
-        return json.load(f)['sections']
+        sections = json.load(f)['sections']
+    for info in sections.values():
+        info['heading'] = _strip_source_formatting(info['heading'])
+    return sections
 
 
 def _read_unit_intro(sections_dir: Path, num: str,
@@ -1623,6 +1684,11 @@ def main():
         deep_rows = json.load(f)
     bdeep = collect_deep_headings(cfg.base.sections_dir, base_sections)
     cdeep = collect_deep_headings(cfg.comparison.sections_dir, comp_sections)
+    # Strip source formatting from deep heading paths so they match the
+    # stripped section text from read_section_file.
+    for d in bdeep + cdeep:
+        if 'path' in d:
+            d['path'] = [_strip_source_formatting(p) for p in d['path']]
     bdeep_children: dict[str, list[str]] = {}
     for d in bdeep:
         bdeep_children.setdefault(d['container'], []).append(d['id'])

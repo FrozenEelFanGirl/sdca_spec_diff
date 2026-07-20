@@ -100,6 +100,14 @@ MAPPING_FIXUPS: dict[tuple[str, str], list[dict]] = {
                       'deprecation stub (combined 0.035) — pair anyway so '
                       'the old text shows next to the deprecation note',
         },
+        {
+            'base_num': '4.7.3#Effect of Reset on Function_Status Control',
+            'comp_num': '4.7.3',
+            'reason': 'v1.2 promoted the old §4.7.3 into a section-level '
+                      'heading and added a new intro §4.7.3; the old content '
+                      'now lives under the deep heading, pairing to the '
+                      'now-deleted comp §4.7.3',
+        },
     ],
 }
 

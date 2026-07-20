@@ -39,17 +39,24 @@ python -X utf8 scripts/compare_sections.py doc/comparison_<base>_<comp>/index/<k
 ## Testing
 
 ```bash
-python -X utf8 -m unittest tests.test_section_5_1_golden -v
+python -X utf8 -m unittest discover -s tests -v
 ```
 
-The test runs nothing itself — completing the section 5.1 workflow is a
-prerequisite (`extract_all.py` → `map_sections.py` → `map_fixups.py` →
-`search_sections.py --section 5.1` →
-`compare_sections.py .../index/section_5_1.md`). The test then asserts the
-generated `doc/comparison_*/sections/5.1_..._comparison.md` is byte-for-byte
-identical to the manually reviewed golden file at
-`tests/5.1_Overview_of_SDCA_Functions_comparison_golden.md`. If the
-comparison file is missing, the test fails with the workflow commands to run.
+Four golden tests cover key comparison patterns:
+
+| Test | Section | Pattern covered |
+|---|---|---|
+| `test_section_5_1_golden` | 5.1 | Overview — full mixed content |
+| `test_section_4_7_2_golden` | 4.7.2 | Paragraph word diff (`**`/`~~`) |
+| `test_section_4_7_3_golden` | 4.7.3 | Mapping fixup (deep↔section cross-granularity) |
+| `test_section_10_1_2_golden` | 10.1.2 | Numbered list diff with sub-items |
+
+The tests run nothing themselves — completing the workflow for each section
+is a prerequisite (`extract_all.py` → `map_sections.py` → `map_fixups.py` →
+`search_sections.py --section <num>` →
+`compare_sections.py .../index/section_<num>.md`). Each test asserts the
+generated comparison file is byte-for-byte identical to the manually reviewed
+golden file at `tests/<num>_<heading>_comparison_golden.md`.
 
 **Limitations:**
 
@@ -80,6 +87,18 @@ cfg = load_config()
 ```
 
 ## Stage 1: Preparation
+
+**Before extraction — check source document formatting.** The original MIPI SDCA
+`.docx` files may contain heading-formatting errors that affect extraction. In
+particular, fifth-level headings (`#####` / OOXML outline level 4) can be
+merged into a parent heading's text within a single OOXML paragraph, so the
+sub-heading is accidentally exported as part of the heading content rather than
+as a separate heading node. Known affected sections: **"Headset Operation"**,
+**"Optical Output"**, and **"Example SoundWire Classic Lane Mapping"**.
+Inspect the source `.docx` for heading paragraphs containing embedded
+sub-heading text (often separated by a line break within the same paragraph).
+After correcting any formatting issues, select the table of contents and press
+**F9** to update the entire TOC.
 
 ### init_config.py
 
