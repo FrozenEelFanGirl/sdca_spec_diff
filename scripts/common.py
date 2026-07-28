@@ -270,20 +270,41 @@ def table_to_markdown(tbl_elem):
         get_logger('common').warning('Empty table element found (zero w:tr rows)')
         return ''
 
+    def _grid_span(cell):
+        tcPr = cell.find(f'{{{W}}}tcPr')
+        if tcPr is not None:
+            gs = tcPr.find(f'{{{W}}}gridSpan')
+            if gs is not None:
+                val = gs.get(f'{{{W}}}val')
+                if val is not None:
+                    return int(val)
+        return 1
+
+    # Compute max effective columns from all rows (accounting for merged cells)
+    max_cols = 0
+    for row in rows:
+        effective = sum(_grid_span(c) for c in row.findall(f'{{{W}}}tc'))
+        if effective > max_cols:
+            max_cols = effective
+
     lines = []
     for ri, row in enumerate(rows):
         cells = row.findall(f'{{{W}}}tc')
         cell_texts = []
         for cell in cells:
+            span = _grid_span(cell)
             paras = []
             for p in cell.findall(f'{{{W}}}p'):
                 text = para_to_markdown(p).strip()
                 if text:
                     paras.append(text.replace('|', '\\|').replace('\n', ' '))
-            cell_texts.append(' '.join(paras))
+            text = ' '.join(paras)
+            cell_texts.append(text)
+            for _ in range(span - 1):
+                cell_texts.append('')
         lines.append('| ' + ' | '.join(cell_texts) + ' |')
         if ri == 0:
-            lines.append('|' + '|'.join(['---' for _ in cells]) + '|')
+            lines.append('|' + '|'.join(['---'] * max_cols) + '|')
 
     return '\n'.join(lines)
 

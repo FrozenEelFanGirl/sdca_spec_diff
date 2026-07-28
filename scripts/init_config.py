@@ -334,7 +334,7 @@ def main():
             sys.exit(1)
 
     # Discover docx files
-    docx_files = sorted(DOC_SOURCES.glob('*.docx'))
+    docx_files = sorted(p for p in DOC_SOURCES.glob('*.docx') if not p.name.startswith('~$'))
     if not docx_files:
         print(f'Error: no .docx files found in {DOC_SOURCES.relative_to(ROOT)}', file=sys.stderr)
         sys.exit(1)
