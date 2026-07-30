@@ -47,7 +47,7 @@ import sys
 import os
 import json
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ''))
+
 
 from config import load_config  # noqa: E402
 from common import sort_key, collect_deep_headings  # noqa: E402

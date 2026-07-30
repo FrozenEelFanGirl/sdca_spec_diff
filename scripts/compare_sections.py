@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ''))
+
 
 from config import load_config, ROOT
 from common import (SPELLING_VARIANTS, get_logger, direct_children, own_scope,
@@ -610,6 +610,8 @@ def _diff_table(base_block: str, comp_block: str) -> tuple[list[str], list[str]]
     br = base_block.strip().split('\n'); cr = comp_block.strip().split('\n')
 
     def _sep(row):
+        # Character class [ |\-:] matches space, literal-pipe, dash, colon.
+        # The pipe inside [] is a literal pipe in Python's re engine.
         return bool(re.match(r'^\|[ |\-:]+\|$', row))
 
     def _cells(row):
@@ -628,7 +630,18 @@ def _diff_table(base_block: str, comp_block: str) -> tuple[list[str], list[str]]
         else: cg.append(_cells(r))
 
     if not cg:
-        return [_rebuild([], br, bs)], []
+        max_c = max((len(row) for row in bg), default=0)
+        for row in bg:
+            while len(row) < max_c:
+                row.append('')
+        bo_rows = []
+        for brow in bg:
+            bo_rows.append('| ' + ' | '.join('**' + c + '**' for c in brow) + ' |')
+        co_rows = []
+        for _brow in bg:
+            cc = ['**New in this version**'] + [''] * (max_c - 1)
+            co_rows.append('| ' + ' | '.join(cc) + ' |')
+        return (_rebuild(bo_rows, br, bs), _rebuild(co_rows, cr, cs))
 
     max_c = max((len(row) for row in bg + cg), default=0)
     for row in bg:

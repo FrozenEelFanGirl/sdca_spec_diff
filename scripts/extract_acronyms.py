@@ -41,7 +41,7 @@ import zipfile
 from pathlib import Path
 from lxml import etree
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ''))
+
 
 from config import ROOT  # noqa: E402
 from common import W, NS, DEFINITION_STYLES, build_style_map, parse_toc, para_to_markdown, parse_xml

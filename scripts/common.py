@@ -40,15 +40,17 @@ W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 _SECURE_PARSER = etree.XMLParser(resolve_entities=False)
 
 
-def parse_xml(xml_bytes):
-    """Parse XML bytes with entity expansion disabled."""
-    return etree.fromstring(xml_bytes, _SECURE_PARSER)
 WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
 A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 PIC = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
 VML = 'urn:schemas-microsoft-com:vml'
 NS = {'w': W}
+
+
+def parse_xml(xml_bytes):
+    """Parse XML bytes with entity expansion disabled."""
+    return etree.fromstring(xml_bytes, _SECURE_PARSER)
 
 # ── Style sets ──────────────────────────────────────────────────────────────
 
@@ -277,7 +279,10 @@ def table_to_markdown(tbl_elem):
             if gs is not None:
                 val = gs.get(f'{{{W}}}val')
                 if val is not None:
-                    return int(val)
+                    try:
+                        return int(val)
+                    except (ValueError, TypeError):
+                        return 1
         return 1
 
     # Compute max effective columns from all rows (accounting for merged cells)

@@ -204,77 +204,77 @@ def para_text(p_elem):
 
 def _parse_docx(docx_path: Path):
     """Yield (num, heading, level, all_text) for every section in the docx."""
-    z = zipfile.ZipFile(str(docx_path))
-    styles_xml = z.read('word/styles.xml')
-    style_map = build_style_map(styles_xml)
-    doc_xml = z.read('word/document.xml')
-    root = parse_xml(doc_xml)
-    body = root.find(f'{{{W}}}body')
+    with zipfile.ZipFile(str(docx_path)) as z:
+        styles_xml = z.read('word/styles.xml')
+        style_map = build_style_map(styles_xml)
+        doc_xml = z.read('word/document.xml')
+        root = parse_xml(doc_xml)
+        body = root.find(f'{{{W}}}body')
 
-    num_to_heading, _ = parse_toc(doc_xml)
+        num_to_heading, _ = parse_toc(doc_xml)
 
-    body_children = list(body)
-    heading_positions = []
-    for idx, child in enumerate(body_children):
-        if child.tag != f'{{{W}}}p':
-            continue
-        pPr = child.find('w:pPr', NS)
-        if pPr is None:
-            continue
-        pStyle = pPr.find('w:pStyle', NS)
-        if pStyle is None:
-            continue
-        style_id = pStyle.get(f'{{{W}}}val')
-        lvl = style_map.get(style_id, {}).get('resolved_outline')
-        if lvl is None:
-            continue
-        text = para_text(child).strip()
-        if not text:
-            continue
-        h_norm = re.sub(r'^[\dA-Z\.]+\s*', '',
-                        text.lower().replace('–', '-').replace('—', '-')).strip()
-        for num, heading in num_to_heading.items():
-            nh = re.sub(r'^[\dA-Z\.]+\s*', '',
-                        heading.lower().replace('–', '-').replace('—', '-')).strip()
-            if nh == h_norm:
-                heading_positions.append((idx, num, text, lvl))
-                break
+        body_children = list(body)
+        heading_positions = []
+        for idx, child in enumerate(body_children):
+            if child.tag != f'{{{W}}}p':
+                continue
+            pPr = child.find('w:pPr', NS)
+            if pPr is None:
+                continue
+            pStyle = pPr.find('w:pStyle', NS)
+            if pStyle is None:
+                continue
+            style_id = pStyle.get(f'{{{W}}}val')
+            lvl = style_map.get(style_id, {}).get('resolved_outline')
+            if lvl is None:
+                continue
+            text = para_text(child).strip()
+            if not text:
+                continue
+            h_norm = re.sub(r'^[\dA-Z\.]+\s*', '',
+                            text.lower().replace('–', '-').replace('—', '-')).strip()
+            for num, heading in num_to_heading.items():
+                nh = re.sub(r'^[\dA-Z\.]+\s*', '',
+                            heading.lower().replace('–', '-').replace('—', '-')).strip()
+                if nh == h_norm:
+                    heading_positions.append((idx, num, text, lvl))
+                    break
 
-    section_to_pos = {hp[1]: i for i, hp in enumerate(heading_positions)}
-    all_nums = sorted(num_to_heading.keys(), key=sort_key)
+        section_to_pos = {hp[1]: i for i, hp in enumerate(heading_positions)}
+        all_nums = sorted(num_to_heading.keys(), key=sort_key)
 
-    for section_num in all_nums:
-        if section_num not in section_to_pos:
-            continue
+        for section_num in all_nums:
+            if section_num not in section_to_pos:
+                continue
 
-        pos_idx = section_to_pos[section_num]
-        child_idx, heading_text, target_level = (
-            heading_positions[pos_idx][0],
-            heading_positions[pos_idx][2],
-            heading_positions[pos_idx][3],
-        )
+            pos_idx = section_to_pos[section_num]
+            child_idx, heading_text, target_level = (
+                heading_positions[pos_idx][0],
+                heading_positions[pos_idx][2],
+                heading_positions[pos_idx][3],
+            )
 
-        end_idx = len(body_children)
-        for j in range(pos_idx + 1, len(heading_positions)):
-            if heading_positions[j][3] <= target_level:
-                end_idx = heading_positions[j][0]
-                break
+            end_idx = len(body_children)
+            for j in range(pos_idx + 1, len(heading_positions)):
+                if heading_positions[j][3] <= target_level:
+                    end_idx = heading_positions[j][0]
+                    break
 
-        all_text = heading_text + ' '
-        for i in range(child_idx + 1, end_idx):
-            child = body_children[i]
-            if child.tag == f'{{{W}}}p':
-                text = para_text(child).strip()
-                if text:
-                    all_text += text + ' '
-            elif child.tag == f'{{{W}}}tbl':
-                for tc in child.iter(f'{{{W}}}tc'):
-                    for p in tc.findall(f'{{{W}}}p'):
-                        text = para_text(p).strip()
-                        if text:
-                            all_text += text + ' '
+            all_text = heading_text + ' '
+            for i in range(child_idx + 1, end_idx):
+                child = body_children[i]
+                if child.tag == f'{{{W}}}p':
+                    text = para_text(child).strip()
+                    if text:
+                        all_text += text + ' '
+                elif child.tag == f'{{{W}}}tbl':
+                    for tc in child.iter(f'{{{W}}}tc'):
+                        for p in tc.findall(f'{{{W}}}p'):
+                            text = para_text(p).strip()
+                            if text:
+                                all_text += text + ' '
 
-        yield section_num, heading_text, target_level, all_text
+            yield section_num, heading_text, target_level, all_text
 
 
 # ── Search ──────────────────────────────────────────────────────────────────

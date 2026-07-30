@@ -33,7 +33,7 @@ import sys
 import os
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ''))
+
 
 from config import load_config, ROOT  # noqa: E402
 

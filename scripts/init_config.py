@@ -136,10 +136,9 @@ class DocInfo:
 
 def inspect_docx(docx_path: Path) -> DocInfo:
     """Extract version metadata from a docx file."""
-    z = zipfile.ZipFile(str(docx_path))
-    meta = _read_core_xml(z)
-    paras = _read_first_page_paragraphs(z)
-    z.close()
+    with zipfile.ZipFile(str(docx_path)) as z:
+        meta = _read_core_xml(z)
+        paras = _read_first_page_paragraphs(z)
 
     version_cover = _parse_version_from_cover(paras)
     cover_date = _parse_date_from_cover(paras)

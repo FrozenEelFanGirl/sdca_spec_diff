@@ -44,10 +44,10 @@ def diff_images(path1: str, path2: str, threshold: int = 30) -> tuple[float, flo
     # Resize both to a common size so pixels align 1:1.
     # Using the average dimensions avoids cropping either image and
     # prevents false-positive diffs caused by independent resize+ crop.
-    h = (img1.height + img2.height) // 2
-    w1 = int(img1.width * h / img1.height)
-    w2 = int(img2.width * h / img2.height)
-    w = (w1 + w2) // 2
+    h = round((img1.height + img2.height) / 2)
+    w1 = round(img1.width * h / img1.height)
+    w2 = round(img2.width * h / img2.height)
+    w = round((w1 + w2) / 2)
 
     img1_r = img1.resize((w, h), Image.LANCZOS)
     img2_r = img2.resize((w, h), Image.LANCZOS)

@@ -68,6 +68,14 @@ golden file at `tests/<num>_<heading>_comparison_golden.md`.
   comparison file passes even if the scripts have changed since. Re-run the
   workflow before testing a code change.
 
+**Golden files are hand-reviewed artifacts — never overwrite them automatically.**
+When a code change causes a golden test to fail, stop and report the diff to
+the user. The user reviews the diff, decides whether the new output is correct,
+and updates the golden file themselves. This is not a step to automate. To make
+comparison easier, write the regenerated output to a sibling file with a
+`_REGENERATED.md` suffix (e.g. `5.1_..._golden.md` → `5.1_..._REGENERATED.md`)
+so the user can diff them.
+
 ## Configuration
 
 `scripts/config.py` — shared module, `load_config()` returns typed `Config` with all paths.
