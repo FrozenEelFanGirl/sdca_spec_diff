@@ -113,9 +113,12 @@ Edit the generated report — remove `✓` from unwanted rows, or add `✓` to a
 
 ```bash
 python -X utf8 scripts/compare_sections.py doc/comparison_<base>_<comp>/index/<keyword>.md
+python -X utf8 scripts/compare_sections.py                     # compare ALL sections
+# Example:
+python -X utf8 scripts/compare_sections.py doc/comparison_v1p2r17_v1p0/index/software_sequence.md
 ```
 
-(Omit the report argument to compare all sections from the mapping.)
+Omit the report argument to compare all sections from the mapping.
 
 This creates interleaved comparison files for each checked section, anchored to the section and deep-heading mappings: every base section, subsection, and deep heading is paired with its mapped counterpart wherever it lives in the comparison document. Within each pair, blocks are aligned by content similarity: each base block is immediately followed by its comparison counterpart in blockquotes (prefixed with `> **vX.Y:**`). Body paragraphs get word-level inline diffs — **bold** for new/changed text, ~~strikethrough~~ for removed text. Lists get per-item diffs, tables per-cell diffs, and figures are pixel-diffed.
 
